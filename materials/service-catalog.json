@@ -1,0 +1,14 @@
+{
+  "catalogVersion": "CAT-2026-07-31",
+  "costFormula": "abs(originGridX-pointGridX)+abs(originGridY-pointGridY)+barrierPenalty",
+  "points": [
+    {"id": "POINT-A", "grid": [1, 1], "services": ["LEGAL_AID", "MEDIATION"], "access": ["STEP_FREE", "TEXT_COMMUNICATION"], "barrierPenalty": 0},
+    {"id": "POINT-B", "grid": [2, 1], "services": ["LEGAL_AID", "NOTARY"], "access": ["SIGN_INTERPRETER"], "barrierPenalty": 1},
+    {"id": "POINT-C", "grid": [5, 5], "services": ["LEGAL_AID", "NOTARY", "MEDIATION"], "access": ["STEP_FREE", "SIGN_INTERPRETER", "TEXT_COMMUNICATION"], "barrierPenalty": 0}
+  ],
+  "hardRequirements": {"WHEELCHAIR": "STEP_FREE", "HEARING": "SIGN_INTERPRETER", "SPEECH": "TEXT_COMMUNICATION"},
+  "tieBreak": ["totalCost ascending", "point id ascending"],
+  "closures": [{"eventId": "CLOSE-01", "pointId": "POINT-C", "from": "2026-08-02T00:00:00Z", "to": "2026-08-04T00:00:00Z"}],
+  "homeService": {"allowedService": "LEGAL_AID", "allowedMobility": ["HOMEBOUND"], "reason": "HOME_SERVICE_REQUIRED"}
+}
+
