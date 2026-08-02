@@ -23,6 +23,8 @@ pub struct CatalogImport {
     pub tie_break: Option<Vec<String>>,
     #[serde(default)]
     pub closures: Vec<ClosureImport>,
+    #[serde(rename = "capabilityEvents", default)]
+    pub capability_events: Vec<CapabilityEventImport>,
     #[serde(rename = "homeService", default)]
     pub home_service: Option<HomeServiceImport>,
 }
@@ -49,6 +51,19 @@ pub struct ClosureImport {
     pub to: String,
 }
 
+/// A capability degradation: one access capability at one point is
+/// temporarily unavailable on the half-open interval [from, to).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapabilityEventImport {
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "pointId")]
+    pub point_id: String,
+    pub capability: String,
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct HomeServiceImport {
     #[serde(rename = "allowedService")]
@@ -70,6 +85,7 @@ pub struct Catalog {
     /// need (mobility or communication) -> required access capability
     pub hard_requirements: BTreeMap<String, String>,
     pub closures: Vec<Closure>, // sorted by (point id, from, event id)
+    pub capability_events: Vec<CapabilityEvent>, // sorted by (point id, from, event id)
     pub home_service: Option<HomeService>,
 }
 
@@ -87,6 +103,17 @@ pub struct Point {
 pub struct Closure {
     pub event_id: String,
     pub point_id: String,
+    pub from_ts: i64, // epoch seconds, inclusive
+    pub to_ts: i64,   // epoch seconds, exclusive
+    pub from_rfc3339: String,
+    pub to_rfc3339: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityEvent {
+    pub event_id: String,
+    pub point_id: String,
+    pub capability: String,
     pub from_ts: i64, // epoch seconds, inclusive
     pub to_ts: i64,   // epoch seconds, exclusive
     pub from_rfc3339: String,
@@ -239,6 +266,8 @@ pub struct ImportResponse {
     pub active: bool,
     pub points: usize,
     pub closures: usize,
+    #[serde(rename = "capabilityEvents")]
+    pub capability_events: usize,
 }
 
 #[derive(Debug, Serialize)]

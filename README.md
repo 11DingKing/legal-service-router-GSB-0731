@@ -8,13 +8,13 @@ Axum, SQLite (bundled, WAL). No external map or route API.
 
 ## Source material
 
-`materials/service-catalog.json` fixes service-point IDs, capability names, catalog versions, closure events, and home-service eligibility examples. `POST /catalog/import` accepts exactly this format.
+`materials/service-catalog.json` fixes service-point IDs, capability names, catalog versions, closure events, capability degradation events, and home-service eligibility examples. `POST /catalog/import` accepts exactly this format (`capabilityEvents` is optional in other catalogs).
 
 ## Build, test, run
 
 ```bash
 cargo build
-cargo test                 # 13 tests: unit + end-to-end API tests
+cargo test                 # 18 tests: unit + end-to-end API tests
 cargo run -- --import materials/service-catalog.json
 ```
 
@@ -29,30 +29,31 @@ Created automatically on startup (`db::init_schema`):
 - `point_services(version, point_id, service)` / `point_access(version, point_id, access)`
 - `hard_requirements(version, need, access)` — maps a mobility/communication need to a mandatory access capability (e.g. `WHEELCHAIR → STEP_FREE`, `HEARING → SIGN_INTERPRETER`, `SPEECH → TEXT_COMMUNICATION`).
 - `closures(version, event_id, point_id, from_ts, to_ts)` — epoch seconds.
+- `capability_events(version, event_id, point_id, capability, from_ts, to_ts)` — temporary capability degradations, epoch seconds.
 - `home_service(version, allowed_service, reason)` + `home_service_mobility(version, mobility)`
 - `snapshots(snapshot_id PK, version, kind, request_json, response_json, created_at)` — immutable routing snapshots.
 
 ## Endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/health` | liveness |
-| POST | `/catalog/import` | import catalog JSON, atomically activate its version |
-| GET | `/catalog/active` | active version summary |
-| GET | `/catalog/versions` | all versions + active flag |
-| POST | `/route` | route one applicant, persist + return snapshot |
-| POST | `/route/batch` | `{"requests": [...]}`, one version for the whole batch |
-| GET | `/snapshots/{id}` | replay a stored snapshot **verbatim** (never recomputed) |
+| Method | Path                | Purpose                                                  |
+| ------ | ------------------- | -------------------------------------------------------- |
+| GET    | `/health`           | liveness                                                 |
+| POST   | `/catalog/import`   | import catalog JSON, atomically activate its version     |
+| GET    | `/catalog/active`   | active version summary                                   |
+| GET    | `/catalog/versions` | all versions + active flag                               |
+| POST   | `/route`            | route one applicant, persist + return snapshot           |
+| POST   | `/route/batch`      | `{"requests": [...]}`, one version for the whole batch   |
+| GET    | `/snapshots/{id}`   | replay a stored snapshot **verbatim** (never recomputed) |
 
 Route request:
 
 ```json
 {
   "serviceNeed": "LEGAL_AID",
-  "mobility": "WHEELCHAIR",        // default "STANDARD"
+  "mobility": "WHEELCHAIR", // default "STANDARD"
   "communication": ["HEARING"],
-  "origin": {"x": 2, "y": 0},
-  "at": "2026-08-02T12:00:00Z"     // optional, defaults to now
+  "origin": { "x": 2, "y": 0 },
+  "at": "2026-08-02T12:00:00Z" // optional, defaults to now
 }
 ```
 
@@ -74,6 +75,7 @@ in this fixed order:
 1. `SERVICE_UNAVAILABLE` — point does not offer `serviceNeed`.
 2. `MISSING_REQUIRED_ACCESS` (+`capability`) — point lacks a capability required by `hardRequirements` for the applicant's mobility/communication needs.
 3. `TEMPORARILY_CLOSED` (+`eventId`, `from`, `to`) — a closure is active at `at`.
+4. `CAPABILITY_DEGRADED` (+`capability`, `eventId`, `from`, `to`) — a degradation event is active at `at` and the applicant requires the degraded capability.
 
 Only points with an empty reason chain become candidates. Cost is the catalog
 formula implemented natively:
@@ -82,9 +84,21 @@ formula implemented natively:
 totalCost = abs(originGridX - pointGridX) + abs(originGridY - pointGridY) + barrierPenalty
 ```
 
-**Closures are half-open `[from, to)`**: at `from` the point is closed
-(inclusive), at `to` it is open again (exclusive). The boundary instants are
-covered by `closure_endpoints_are_half_open`.
+**Closures and degradations are half-open `[from, to)`**: at `from` the event
+is active (inclusive), at `to` the point is normal again (exclusive). The
+boundary instants are covered by `closure_endpoints_are_half_open` and
+`degradation_window_and_overlap_priority`.
+
+**Event overlap priority**: when a closure and one or more degradations are
+active at the same point at the same time, the closure dominates — the chain
+reports `TEMPORARILY_CLOSED` only, since the whole location is unreachable
+anyway. The fixture exercises this: `CLOSE-01` closes POINT-C on
+`[2026-08-02, 2026-08-04)` while `DEGRADE-01` removes its `SIGN_INTERPRETER`
+capability on `[2026-08-03, 2026-08-05)`, so 08-03 is closure-dominated and
+`[08-04, 08-05)` reports `CAPABILITY_DEGRADED`. A degradation only excludes
+applicants who actually require the degraded capability — a wheelchair user
+who does not need `SIGN_INTERPRETER` still reaches POINT-C during DEGRADE-01.
+Outside every event window, results are identical to the pre-window baseline.
 
 **Home service**: if `mobility` is in `homeService.allowedMobility`, no
 physical point is reachable. If `serviceNeed == allowedService`, the outcome
@@ -105,21 +119,37 @@ and `equal_cost_candidates_tie_break_by_point_id`.
 - Import is one write transaction: insert the new version's rows and flip
   `is_active` atomically. Readers on WAL connections see either the complete
   old version or the complete new one — never a mixture.
-- Each `/route` and `/route/batch` request loads the active catalog inside a
-  single read transaction, so one request (and one batch) sees exactly one
-  catalog version even while an import commits concurrently.
+- Each `/route` and `/route/batch` request pins the version active at its
+  start (`active_version_now`); a batch pins once, so every snapshot in one
+  batch carries the same `catalogVersion` even if an import commits while the
+  batch runs (`batch_pinned_to_one_version_during_hot_reload`: 20 concurrent
+  batches racing a version swap).
 - Snapshots store the full response JSON at request time. `GET
-  /snapshots/{id}` returns the stored bytes verbatim, so replaying an old
+/snapshots/{id}` returns the stored bytes verbatim, so replaying an old
   snapshot can never mix in data imported later.
 - Verified by `hot_reload_keeps_requests_consistent_and_replays_immutable`
   (32 concurrent readers racing a version swap; every response asserts
   version-complete data, old snapshot replays unchanged).
 
+## Query caching
+
+Two in-memory caches sit in front of SQLite:
+
+- **Catalog cache** keyed by version — catalog versions are immutable, so a
+  cached catalog is always complete and correct for that version.
+- **Route cache** keyed by `(catalog version, normalized request JSON)`. A
+  hit returns byte-identical content (modulo a freshly minted `snapshotId`)
+  and is still persisted as its own snapshot.
+
+Both caches are **cleared on every successful import**, so a query after a
+hot reload can never observe stale pre-import data
+(`cache_hit_is_deterministic_and_invalidated_on_reload`).
+
 ## Performance record
 
 `large_catalog_performance_record` builds a deterministic 3000-point catalog,
-imports it, and runs 100 identical route requests, asserting the result is
-stable across rounds. Reproduce with:
+imports it, then runs 100 route requests with distinct origins (route-cache
+misses) plus one repeated request (cache hit). Reproduce with:
 
 ```bash
 cargo test --release large_catalog_performance_record -- --nocapture
@@ -128,12 +158,11 @@ cargo test --release large_catalog_performance_record -- --nocapture
 Observed on this machine (Apple Silicon, release build):
 
 ```
-PERF_RECORD catalog_points=3000 rounds=100 import_ms=16.1 \
-  route_avg_ms=42.24 route_p95_ms=59.94 route_max_ms=108.58 \
+PERF_RECORD catalog_points=3000 rounds=100 import_ms=13.2 \
+  miss_avg_ms=8.70 miss_p95_ms=19.59 miss_max_ms=97.60 hit_ms=4.33 \
   candidates=200 exclusions=2800
 ```
 
-(Debug build for the same record: avg ≈ 304 ms, p95 ≈ 414 ms.)
+(Debug build for the same record: miss avg ≈ 55 ms, p95 ≈ 79 ms.)
 
 Docker is outside the project contract.
-

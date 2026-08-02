@@ -7,13 +7,18 @@ use crate::model::*;
 pub const REASON_SERVICE_UNAVAILABLE: &str = "SERVICE_UNAVAILABLE";
 pub const REASON_MISSING_ACCESS: &str = "MISSING_REQUIRED_ACCESS";
 pub const REASON_CLOSED: &str = "TEMPORARILY_CLOSED";
+pub const REASON_DEGRADED: &str = "CAPABILITY_DEGRADED";
 pub const REASON_HOME_REQUIRED: &str = "HOME_SERVICE_REQUIRED";
 pub const REASON_HOME_UNAVAILABLE: &str = "HOME_SERVICE_NOT_AVAILABLE";
 
-/// A closure is active on the half-open interval [from, to): the "from"
-/// instant is closed, the "to" instant is open again.
+/// Closures and capability degradations are active on the half-open interval
+/// [from, to): the "from" instant is affected, the "to" instant is normal.
 pub fn closure_active(c: &Closure, at_epoch: i64) -> bool {
     c.from_ts <= at_epoch && at_epoch < c.to_ts
+}
+
+pub fn degradation_active(e: &CapabilityEvent, at_epoch: i64) -> bool {
+    e.from_ts <= at_epoch && at_epoch < e.to_ts
 }
 
 /// Native implementation of the catalog cost formula
@@ -101,8 +106,16 @@ pub fn route(cat: &Catalog, req: &NormalizedRequest, snapshot_id: String) -> Rou
                 });
             }
         }
-        for c in cat.closures.iter().filter(|c| c.point_id == p.id) {
-            if closure_active(c, req.at_epoch) {
+        // Event overlap priority: an active closure dominates capability
+        // degradations at the same point — the whole location is closed, so
+        // degradation reasons would be redundant noise in the chain.
+        let active_closures: Vec<&Closure> = cat
+            .closures
+            .iter()
+            .filter(|c| c.point_id == p.id && closure_active(c, req.at_epoch))
+            .collect();
+        if !active_closures.is_empty() {
+            for c in active_closures {
                 reasons.push(ExclusionReason {
                     code: REASON_CLOSED.to_string(),
                     capability: None,
@@ -110,6 +123,24 @@ pub fn route(cat: &Catalog, req: &NormalizedRequest, snapshot_id: String) -> Rou
                     from: Some(c.from_rfc3339.clone()),
                     to: Some(c.to_rfc3339.clone()),
                 });
+            }
+        } else {
+            // A degradation only excludes the point when the applicant
+            // actually requires the degraded capability.
+            for e in cat
+                .capability_events
+                .iter()
+                .filter(|e| e.point_id == p.id && degradation_active(e, req.at_epoch))
+            {
+                if required.iter().any(|r| r == &e.capability) {
+                    reasons.push(ExclusionReason {
+                        code: REASON_DEGRADED.to_string(),
+                        capability: Some(e.capability.clone()),
+                        event_id: Some(e.event_id.clone()),
+                        from: Some(e.from_rfc3339.clone()),
+                        to: Some(e.to_rfc3339.clone()),
+                    });
+                }
             }
         }
 
@@ -172,6 +203,23 @@ mod tests {
         assert!(closure_active(&c, 100), "from endpoint is closed");
         assert!(closure_active(&c, 199));
         assert!(!closure_active(&c, 200), "to endpoint is open again");
+    }
+
+    #[test]
+    fn degradation_window_is_half_open() {
+        let e = CapabilityEvent {
+            event_id: "D".into(),
+            point_id: "P".into(),
+            capability: "SIGN_INTERPRETER".into(),
+            from_ts: 100,
+            to_ts: 200,
+            from_rfc3339: String::new(),
+            to_rfc3339: String::new(),
+        };
+        assert!(!degradation_active(&e, 99));
+        assert!(degradation_active(&e, 100), "from endpoint is degraded");
+        assert!(degradation_active(&e, 199));
+        assert!(!degradation_active(&e, 200), "to endpoint is normal again");
     }
 
     #[test]

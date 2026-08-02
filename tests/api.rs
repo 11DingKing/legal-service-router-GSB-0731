@@ -345,6 +345,7 @@ async fn hot_reload_keeps_requests_consistent_and_replays_immutable() {
     let mut v2 = fixture_catalog();
     v2["catalogVersion"] = json!("CAT-2026-08-02");
     v2["closures"] = json!([]); // closure lifted in the new version
+    v2["capabilityEvents"] = json!([]); // degradation lifted too
     let import_app = t.app.clone();
     let importer = tokio::spawn(async move { import(&import_app, &v2).await });
 
@@ -385,6 +386,229 @@ async fn hot_reload_keeps_requests_consistent_and_replays_immutable() {
     assert_eq!(replay, v1_out);
     assert_eq!(replay["catalogVersion"], "CAT-2026-07-31");
     assert!(exclusion(&replay, "POINT-C").is_some());
+}
+
+#[tokio::test]
+async fn degradation_window_and_overlap_priority() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    // CLOSE-01 closes POINT-C on [08-02, 08-04); DEGRADE-01 removes
+    // SIGN_INTERPRETER at POINT-C on [08-03, 08-05) — a partial overlap.
+    let hearing_at = |at: &str| {
+        let app = t.app.clone();
+        let at = at.to_string();
+        async move {
+            let req = json!({
+                "serviceNeed": "LEGAL_AID", "communication": ["HEARING"],
+                "origin": {"x": 5, "y": 5}, "at": at
+            });
+            post_json(&app, "/route", &req).await.1
+        }
+    };
+
+    // Closure only: closed reason, no degradation noise.
+    let out = hearing_at("2026-08-02T12:00:00Z").await;
+    let c = exclusion(&out, "POINT-C").unwrap();
+    assert_eq!(reason_codes(c), vec!["TEMPORARILY_CLOSED"]);
+
+    // Overlap begins exactly at the degradation `from` endpoint: the closure
+    // still dominates, degradation must NOT appear in the chain.
+    let out = hearing_at("2026-08-03T00:00:00Z").await;
+    let c = exclusion(&out, "POINT-C").unwrap();
+    assert_eq!(reason_codes(c), vec!["TEMPORARILY_CLOSED"]);
+    assert!(!reason_codes(c).contains(&"CAPABILITY_DEGRADED"));
+
+    // Mid-overlap: same dominance.
+    let out = hearing_at("2026-08-03T12:00:00Z").await;
+    assert_eq!(
+        reason_codes(exclusion(&out, "POINT-C").unwrap()),
+        vec!["TEMPORARILY_CLOSED"]
+    );
+
+    // Closure `to` endpoint: closure lifted, degradation alone now excludes.
+    let out = hearing_at("2026-08-04T00:00:00Z").await;
+    let c = exclusion(&out, "POINT-C").unwrap();
+    assert_eq!(reason_codes(c), vec!["CAPABILITY_DEGRADED"]);
+    assert_eq!(c["reasons"][0]["capability"], "SIGN_INTERPRETER");
+    assert_eq!(c["reasons"][0]["eventId"], "DEGRADE-01");
+    assert_eq!(c["reasons"][0]["from"], "2026-08-03T00:00:00Z");
+    assert_eq!(c["reasons"][0]["to"], "2026-08-05T00:00:00Z");
+
+    // Degradation `to` endpoint: normal again, POINT-C is a candidate.
+    let out = hearing_at("2026-08-05T00:00:00Z").await;
+    assert!(exclusion(&out, "POINT-C").is_none());
+    assert_eq!(out["candidates"][0]["pointId"], "POINT-C");
+
+    // An applicant who does not need the degraded capability is unaffected
+    // even inside the degradation window.
+    let req = json!({
+        "serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
+        "origin": {"x": 5, "y": 5}, "at": "2026-08-04T12:00:00Z"
+    });
+    let (_, out) = post_json(&t.app, "/route", &req).await;
+    assert!(exclusion(&out, "POINT-C").is_none());
+    assert_eq!(out["candidates"][0]["pointId"], "POINT-C");
+
+    // Outside every event window the result equals the pre-window baseline.
+    let strip = |o: &Value| {
+        let mut o = o.clone();
+        o.as_object_mut().unwrap().remove("snapshotId");
+        let req = o["request"].as_object().unwrap();
+        let mut req = req.clone();
+        req.remove("at");
+        req.remove("atEpoch");
+        o.as_object_mut().unwrap().insert("request".into(), Value::Object(req));
+        o
+    };
+    let before = strip(&hearing_at("2026-08-01T12:00:00Z").await);
+    let after = strip(&hearing_at("2026-08-10T12:00:00Z").await);
+    assert_eq!(before, after, "outside event windows results must be unchanged");
+}
+
+#[tokio::test]
+async fn batch_pinned_to_one_version_during_hot_reload() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    let mut v2 = fixture_catalog();
+    v2["catalogVersion"] = json!("CAT-2026-08-02");
+    v2["closures"] = json!([]);
+    v2["capabilityEvents"] = json!([]);
+    let import_app = t.app.clone();
+    let importer = tokio::spawn(async move { import(&import_app, &v2).await });
+
+    let batch = json!({
+        "requests": [
+            {"serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
+             "origin": {"x": 5, "y": 5}, "at": "2026-08-02T12:00:00Z"},
+            {"serviceNeed": "LEGAL_AID", "communication": ["HEARING"],
+             "origin": {"x": 5, "y": 5}, "at": "2026-08-02T12:00:00Z"},
+            {"serviceNeed": "MEDIATION", "origin": {"x": 0, "y": 0},
+             "at": "2026-08-02T12:00:00Z"},
+            {"serviceNeed": "NOTARY", "origin": {"x": 2, "y": 1},
+             "at": "2026-08-02T12:00:00Z"}
+        ]
+    });
+
+    let mut batches = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let app = t.app.clone();
+        let b = batch.clone();
+        batches.spawn(async move { post_json(&app, "/route/batch", &b).await });
+    }
+    let (import_status, _) = importer.await.unwrap();
+    assert_eq!(import_status, StatusCode::CREATED);
+
+    let mut saw_v1 = false;
+    let mut saw_v2 = false;
+    while let Some(res) = batches.join_next().await {
+        let (status, out) = res.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let version = out["catalogVersion"].as_str().unwrap();
+        let snaps = out["snapshots"].as_array().unwrap();
+        assert_eq!(snaps.len(), 4);
+        for s in snaps {
+            // Every snapshot in the batch is pinned to the batch's version.
+            assert_eq!(
+                s["catalogVersion"].as_str().unwrap(),
+                version,
+                "batch must not mix catalog versions"
+            );
+            let c = exclusion(s, "POINT-C");
+            match version {
+                "CAT-2026-07-31" => {
+                    saw_v1 = true;
+                    // v1 at 2026-08-02T12: POINT-C is closed for everyone.
+                    assert!(c.is_some(), "v1 view must show POINT-C closed");
+                }
+                "CAT-2026-08-02" => {
+                    saw_v2 = true;
+                    // v2 lifted every event: HEARING applicant reaches C.
+                    assert!(c.is_none(), "v2 view must show POINT-C open");
+                }
+                other => panic!("unknown version {other}"),
+            }
+        }
+    }
+    assert!(saw_v2);
+    println!("batch pinning during reload: saw_v1={saw_v1} saw_v2={saw_v2}");
+}
+
+#[tokio::test]
+async fn cache_hit_is_deterministic_and_invalidated_on_reload() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    let req = json!({
+        "serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
+        "communication": ["HEARING"],
+        "origin": {"x": 2, "y": 0}, "at": "2026-08-02T12:00:00Z"
+    });
+    let strip = |o: &Value| {
+        let mut o = o.clone();
+        o.as_object_mut().unwrap().remove("snapshotId");
+        o
+    };
+
+    // First call: cache miss. Second call: cache hit — identical content,
+    // different snapshotId, and both snapshots are persisted independently.
+    let (_, r1) = post_json(&t.app, "/route", &req).await;
+    let (_, r2) = post_json(&t.app, "/route", &req).await;
+    assert_ne!(r1["snapshotId"], r2["snapshotId"]);
+    assert_eq!(strip(&r1), strip(&r2), "cache hit must be identical");
+    let (st, replay1) = get(&t.app, &format!("/snapshots/{}", r1["snapshotId"].as_str().unwrap())).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(replay1, r1);
+
+    // Hot reload invalidates the cache: the same request must not return
+    // stale pre-import data.
+    let mut v2 = fixture_catalog();
+    v2["catalogVersion"] = json!("CAT-2026-08-02");
+    v2["closures"] = json!([]);
+    v2["capabilityEvents"] = json!([]);
+    import(&t.app, &v2).await;
+    let (_, r3) = post_json(&t.app, "/route", &req).await;
+    assert_eq!(r3["catalogVersion"], "CAT-2026-08-02");
+    assert!(
+        exclusion(&r3, "POINT-C").is_none(),
+        "post-reload result must reflect the new version"
+    );
+    assert_ne!(strip(&r1), strip(&r3));
+
+    // Replaying the pre-reload snapshot still returns the old version's data.
+    let (_, replay1) = get(&t.app, &format!("/snapshots/{}", r1["snapshotId"].as_str().unwrap())).await;
+    assert_eq!(replay1["catalogVersion"], "CAT-2026-07-31");
+    assert!(exclusion(&replay1, "POINT-C").is_some());
+}
+
+#[tokio::test]
+async fn equal_total_cost_with_different_breakdowns() {
+    let t = new_app();
+    // Same totalCost (4) reached by different distance/penalty splits.
+    let catalog = json!({
+        "catalogVersion": "CAT-TIE-2",
+        "points": [
+            {"id": "POINT-N", "grid": [4, 0], "services": ["LEGAL_AID"], "access": ["STEP_FREE"], "barrierPenalty": 0},
+            {"id": "POINT-M", "grid": [2, 0], "services": ["LEGAL_AID"], "access": ["STEP_FREE"], "barrierPenalty": 2}
+        ],
+        "hardRequirements": {"WHEELCHAIR": "STEP_FREE"},
+        "closures": [],
+        "capabilityEvents": []
+    });
+    import(&t.app, &catalog).await;
+    let req = json!({
+        "serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
+        "origin": {"x": 0, "y": 0}, "at": "2026-08-10T00:00:00Z"
+    });
+    let (_, out) = post_json(&t.app, "/route", &req).await;
+    let cands = out["candidates"].as_array().unwrap();
+    assert_eq!(cands.len(), 2);
+    assert_eq!(cands[0]["pointId"], "POINT-M", "tie -> id ascending");
+    assert_eq!(cands[0]["totalCost"], 4);
+    assert_eq!(cands[0]["costBreakdown"], json!({"distance": 2, "barrierPenalty": 2}));
+    assert_eq!(cands[1]["pointId"], "POINT-N");
+    assert_eq!(cands[1]["costBreakdown"], json!({"distance": 4, "barrierPenalty": 0}));
 }
 
 #[tokio::test]
@@ -442,39 +666,53 @@ async fn large_catalog_performance_record() {
     let import_ms = import_start.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(status, StatusCode::CREATED);
 
-    let req = json!({
-        "serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
-        "communication": ["HEARING"],
-        "origin": {"x": 0, "y": 0}, "at": "2026-08-10T00:00:00Z"
-    });
-    let rounds = 100;
-    let mut latencies = Vec::with_capacity(rounds);
+    // 100 rounds, each with a distinct deterministic origin: every round is
+    // a route-cache miss, so this measures real routing cost.
+    let rounds = 100_i64;
+    let mut miss_latencies = Vec::with_capacity(rounds as usize);
     let mut first: Option<Value> = None;
+    let first_origin = json!({"x": -30, "y": -30}); // matches round i = 0
     for i in 0..rounds {
+        let req = json!({
+            "serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
+            "communication": ["HEARING"],
+            "origin": {"x": (i * 13) % 61 - 30, "y": (i * 29) % 61 - 30},
+            "at": "2026-08-10T00:00:00Z"
+        });
         let start = std::time::Instant::now();
         let (status, out) = post_json(&t.app, "/route", &req).await;
-        latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+        miss_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(status, StatusCode::OK);
         if i == 0 {
             first = Some(out);
-        } else {
-            // Deterministic results across repeated identical requests.
-            let mut a = first.clone().unwrap();
-            let mut b = out.clone();
-            for v in [&mut a, &mut b] {
-                v.as_object_mut().unwrap().remove("snapshotId");
-            }
-            assert_eq!(a, b);
         }
     }
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let avg: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
-    let p95 = latencies[(latencies.len() as f64 * 0.95) as usize];
-    let max = *latencies.last().unwrap();
+
+    // Repeating the first request hits the route cache: content must be
+    // identical modulo the fresh snapshotId.
+    let req0 = json!({
+        "serviceNeed": "LEGAL_AID", "mobility": "WHEELCHAIR",
+        "communication": ["HEARING"],
+        "origin": first_origin, "at": "2026-08-10T00:00:00Z"
+    });
+    let hit_start = std::time::Instant::now();
+    let (_, hit) = post_json(&t.app, "/route", &req0).await;
+    let hit_ms = hit_start.elapsed().as_secs_f64() * 1000.0;
+    let mut a = first.clone().unwrap();
+    let mut b = hit.clone();
+    for v in [&mut a, &mut b] {
+        v.as_object_mut().unwrap().remove("snapshotId");
+    }
+    assert_eq!(a, b, "cache hit must reproduce the miss result exactly");
+
+    miss_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg: f64 = miss_latencies.iter().sum::<f64>() / miss_latencies.len() as f64;
+    let p95 = miss_latencies[(miss_latencies.len() as f64 * 0.95) as usize];
+    let max = *miss_latencies.last().unwrap();
     let out = first.unwrap();
     println!(
         "PERF_RECORD catalog_points={n} rounds={rounds} import_ms={import_ms:.1} \
-         route_avg_ms={avg:.2} route_p95_ms={p95:.2} route_max_ms={max:.2} \
+         miss_avg_ms={avg:.2} miss_p95_ms={p95:.2} miss_max_ms={max:.2} hit_ms={hit_ms:.2} \
          candidates={} exclusions={}",
         out["candidates"].as_array().unwrap().len(),
         out["exclusions"].as_array().unwrap().len()

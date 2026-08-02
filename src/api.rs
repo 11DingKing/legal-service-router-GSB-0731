@@ -13,16 +13,27 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Route cache key: (catalog version, normalized request JSON). Because the
+/// version is part of the key and catalog versions are immutable, a hit can
+/// never mix data from another version. Both caches are cleared on import.
+type CatalogCache = Arc<Mutex<HashMap<String, Arc<Catalog>>>>;
+type RouteCache = Arc<Mutex<HashMap<(String, String), RouteOutcome>>>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Arc<Pool>,
+    catalog_cache: CatalogCache,
+    route_cache: RouteCache,
 }
 
 pub fn build_app(pool: Pool) -> Router {
     let state = AppState {
         pool: Arc::new(pool),
+        catalog_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/health", get(health))
@@ -107,6 +118,10 @@ async fn import_catalog(
     let resp = tokio::task::spawn_blocking(move || db::import_catalog(&pool, &cat))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))??;
+    // Hot reload: invalidate every cached catalog and route result so no
+    // query can observe stale pre-import data.
+    st.catalog_cache.lock().unwrap().clear();
+    st.route_cache.lock().unwrap().clear();
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -205,40 +220,80 @@ fn normalize_request(cat: &Catalog, req: &RouteRequest) -> Result<NormalizedRequ
     })
 }
 
-/// Core single-route pipeline shared by /route and /route/batch. Loads the
-/// active catalog inside one read transaction, computes the outcome, then
-/// persists the snapshot in a short write transaction.
-fn route_one(pool: &Pool, req: &RouteRequest) -> Result<RouteOutcome, ApiError> {
+/// Read the currently active catalog version. This single read is the
+/// pinning point: everything downstream is keyed by this immutable version.
+fn active_version_now(pool: &Pool) -> Result<String, ApiError> {
     let conn = pool.get()?;
-    // Read transaction pins the catalog view for this whole request.
-    let tx = conn.unchecked_transaction()?;
-    let version = db::active_version(&tx)?.ok_or(DbError::NoActiveCatalog)?;
-    let cat = db::load_catalog(&tx, &version)?;
-    let normalized = normalize_request(&cat, req)?;
-    let snapshot_id = uuid::Uuid::new_v4().to_string();
-    let outcome = routing::route(&cat, &normalized, snapshot_id.clone());
-    let response_json = serde_json::to_string(&outcome)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let request_json = serde_json::to_string(&normalized)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    tx.commit()?;
+    Ok(db::active_version(&conn)?.ok_or(DbError::NoActiveCatalog)?)
+}
+
+/// Catalogs are immutable per version, so they can be cached by version.
+fn cached_catalog(st: &AppState, version: &str) -> Result<Arc<Catalog>, ApiError> {
+    if let Some(c) = st.catalog_cache.lock().unwrap().get(version) {
+        return Ok(c.clone());
+    }
+    let conn = st.pool.get()?;
+    let cat = Arc::new(db::load_catalog(&conn, version)?);
+    st.catalog_cache
+        .lock()
+        .unwrap()
+        .insert(version.to_string(), cat.clone());
+    Ok(cat)
+}
+
+/// Compute (or reuse) the outcome for one normalized request pinned to one
+/// catalog version, then persist it as a fresh immutable snapshot. Cache
+/// hits still mint a new snapshotId and a new stored snapshot.
+fn outcome_for(
+    st: &AppState,
+    cat: &Arc<Catalog>,
+    normalized: &NormalizedRequest,
+    kind: &str,
+) -> Result<RouteOutcome, ApiError> {
+    let key = (
+        cat.version.clone(),
+        serde_json::to_string(normalized).map_err(|e| ApiError::Internal(e.to_string()))?,
+    );
+    let cached = st.route_cache.lock().unwrap().get(&key).cloned();
+    let outcome = match cached {
+        Some(mut o) => {
+            o.snapshot_id = uuid::Uuid::new_v4().to_string();
+            o
+        }
+        None => {
+            let o = routing::route(cat, normalized, uuid::Uuid::new_v4().to_string());
+            st.route_cache.lock().unwrap().insert(key, o.clone());
+            o
+        }
+    };
+    let response_json =
+        serde_json::to_string(&outcome).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let request_json =
+        serde_json::to_string(normalized).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let conn = st.pool.get()?;
     db::save_snapshot(
         &conn,
-        &snapshot_id,
+        &outcome.snapshot_id,
         &cat.version,
-        "single",
+        kind,
         &request_json,
         &response_json,
     )?;
     Ok(outcome)
 }
 
+fn route_one(st: &AppState, req: &RouteRequest) -> Result<RouteOutcome, ApiError> {
+    let version = active_version_now(&st.pool)?;
+    let cat = cached_catalog(st, &version)?;
+    let normalized = normalize_request(&cat, req)?;
+    outcome_for(st, &cat, &normalized, "single")
+}
+
 async fn route_single(
     State(st): State<AppState>,
     Json(req): Json<RouteRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pool = st.pool.clone();
-    let outcome = tokio::task::spawn_blocking(move || route_one(&pool, &req))
+    let outcome = tokio::task::spawn_blocking(move || route_one(&st, &req))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(outcome))
@@ -251,42 +306,18 @@ async fn route_batch(
     if batch.requests.is_empty() {
         return Err(ApiError::BadRequest("batch must contain at least one request".into()));
     }
-    let pool = st.pool.clone();
     let resp = tokio::task::spawn_blocking(move || -> Result<BatchRouteResponse, ApiError> {
-        let conn = pool.get()?;
-        // The whole batch observes one catalog version in one read txn.
-        let tx = conn.unchecked_transaction()?;
-        let version = db::active_version(&tx)?.ok_or(DbError::NoActiveCatalog)?;
-        let cat = db::load_catalog(&tx, &version)?;
+        // Pin the whole batch to the one version active at this instant.
+        let version = active_version_now(&st.pool)?;
+        let cat = cached_catalog(&st, &version)?;
 
-        let mut normalized = Vec::with_capacity(batch.requests.len());
+        let mut snapshots = Vec::with_capacity(batch.requests.len());
         for r in &batch.requests {
-            normalized.push(normalize_request(&cat, r)?);
-        }
-        let batch_id = uuid::Uuid::new_v4().to_string();
-        let mut snapshots = Vec::with_capacity(normalized.len());
-        for n in normalized {
-            let snapshot_id = uuid::Uuid::new_v4().to_string();
-            snapshots.push(routing::route(&cat, &n, snapshot_id));
-        }
-        tx.commit()?;
-
-        for s in &snapshots {
-            let response_json = serde_json::to_string(s)
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            let request_json = serde_json::to_string(&s.request)
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            db::save_snapshot(
-                &conn,
-                &s.snapshot_id,
-                &cat.version,
-                "batch",
-                &request_json,
-                &response_json,
-            )?;
+            let normalized = normalize_request(&cat, r)?;
+            snapshots.push(outcome_for(&st, &cat, &normalized, "batch")?);
         }
         Ok(BatchRouteResponse {
-            batch_id,
+            batch_id: uuid::Uuid::new_v4().to_string(),
             catalog_version: cat.version.clone(),
             snapshots,
         })

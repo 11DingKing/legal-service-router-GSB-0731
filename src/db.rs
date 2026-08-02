@@ -92,6 +92,15 @@ pub fn init_schema(conn: &Connection) -> Result<(), DbError> {
             to_ts    INTEGER NOT NULL,
             PRIMARY KEY (version, event_id)
         );
+        CREATE TABLE IF NOT EXISTS capability_events (
+            version    TEXT NOT NULL,
+            event_id   TEXT NOT NULL,
+            point_id   TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            from_ts    INTEGER NOT NULL,
+            to_ts      INTEGER NOT NULL,
+            PRIMARY KEY (version, event_id)
+        );
         CREATE TABLE IF NOT EXISTS home_service (
             version         TEXT PRIMARY KEY,
             allowed_service TEXT NOT NULL,
@@ -210,6 +219,31 @@ pub fn import_catalog(pool: &Pool, cat: &CatalogImport) -> Result<ImportResponse
         }
     }
 
+    {
+        let mut ce = tx.prepare(
+            "INSERT INTO capability_events (version, event_id, point_id, capability, from_ts, to_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for e in &cat.capability_events {
+            let from_ts = parse_rfc3339(&e.from)?;
+            let to_ts = parse_rfc3339(&e.to)?;
+            if from_ts >= to_ts {
+                return Err(DbError::BadTime(format!(
+                    "capability event {} has from >= to",
+                    e.event_id
+                )));
+            }
+            ce.execute(params![
+                cat.catalog_version,
+                e.event_id,
+                e.point_id,
+                e.capability,
+                from_ts,
+                to_ts
+            ])?;
+        }
+    }
+
     if let Some(hs) = &cat.home_service {
         tx.execute(
             "INSERT INTO home_service (version, allowed_service, reason) VALUES (?1, ?2, ?3)",
@@ -232,6 +266,7 @@ pub fn import_catalog(pool: &Pool, cat: &CatalogImport) -> Result<ImportResponse
         active: true,
         points: cat.points.len(),
         closures: cat.closures.len(),
+        capability_events: cat.capability_events.len(),
     })
 }
 
@@ -366,6 +401,30 @@ pub fn load_catalog(conn: &Connection, version: &str) -> Result<Catalog, DbError
         }
     }
 
+    let mut capability_events = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT event_id, point_id, capability, from_ts, to_ts FROM capability_events
+             WHERE version = ?1 ORDER BY point_id, from_ts, event_id",
+        )?;
+        let rows = stmt.query_map(params![version], |r| {
+            let from_ts: i64 = r.get(3)?;
+            let to_ts: i64 = r.get(4)?;
+            Ok(CapabilityEvent {
+                event_id: r.get(0)?,
+                point_id: r.get(1)?,
+                capability: r.get(2)?,
+                from_ts,
+                to_ts,
+                from_rfc3339: format_rfc3339(from_ts),
+                to_rfc3339: format_rfc3339(to_ts),
+            })
+        })?;
+        for e in rows {
+            capability_events.push(e?);
+        }
+    }
+
     let home_service: Option<(String, String)> = conn
         .query_row(
             "SELECT allowed_service, reason FROM home_service WHERE version = ?1",
@@ -398,6 +457,7 @@ pub fn load_catalog(conn: &Connection, version: &str) -> Result<Catalog, DbError
         points,
         hard_requirements,
         closures,
+        capability_events,
         home_service,
     })
 }
