@@ -268,35 +268,208 @@ async fn input_order_permutation_is_invariant() {
     assert_eq!(cands, Vec::<&str>::new(), "C closed, A/B lack SIGN_INTERPRETER");
 }
 
+/// A homebound applicant whose every entity option fails on hard conditions:
+/// HOMEBOUND + HEARING + SPEECH + LEGAL_AID during CLOSE-01 excludes A
+/// (no SIGN_INTERPRETER), B (no TEXT_COMMUNICATION) and C (closed).
+fn homebound_hard_blocked_req() -> Value {
+    json!({
+        "serviceNeed": "LEGAL_AID", "mobility": "HOMEBOUND",
+        "communication": ["HEARING", "SPEECH"],
+        "origin": {"x": 1, "y": 1}, "at": "2026-08-02T12:00:00Z"
+    })
+}
+
 #[tokio::test]
-async fn homebound_applicant_gets_home_service_outcome() {
+async fn home_service_is_degradation_path_with_preserved_reason_chain() {
     let t = new_app();
     import(&t.app, &fixture_catalog()).await;
 
-    // Eligible: HOMEBOUND + LEGAL_AID.
+    // All entity points excluded on hard conditions -> HOME_SERVICE_REQUIRED,
+    // and the entity reason chains are preserved verbatim.
+    let (_, out) = post_json(&t.app, "/route", &homebound_hard_blocked_req()).await;
+    assert_eq!(out["homeService"]["eligible"], true);
+    assert_eq!(out["homeService"]["reason"], "HOME_SERVICE_REQUIRED");
+    assert_eq!(out["homeService"]["booking"]["slotId"], "SLOT-AM");
+    assert_eq!(out["homeService"]["booking"]["cost"], 2);
+    assert_eq!(out["candidates"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        reason_codes(exclusion(&out, "POINT-A").unwrap()),
+        vec!["MISSING_REQUIRED_ACCESS"]
+    );
+    assert_eq!(
+        exclusion(&out, "POINT-A").unwrap()["reasons"][0]["capability"],
+        "SIGN_INTERPRETER"
+    );
+    assert_eq!(
+        exclusion(&out, "POINT-B").unwrap()["reasons"][0]["capability"],
+        "TEXT_COMMUNICATION"
+    );
+    assert_eq!(
+        reason_codes(exclusion(&out, "POINT-C").unwrap()),
+        vec!["TEMPORARILY_CLOSED"]
+    );
+
+    // Entity candidates exist -> home service path does NOT trigger.
     let req = json!({
         "serviceNeed": "LEGAL_AID", "mobility": "HOMEBOUND",
         "origin": {"x": 1, "y": 1}, "at": "2026-08-10T00:00:00Z"
     });
     let (_, out) = post_json(&t.app, "/route", &req).await;
-    assert_eq!(out["homeService"]["eligible"], true);
-    assert_eq!(out["homeService"]["reason"], "HOME_SERVICE_REQUIRED");
-    assert_eq!(out["candidates"].as_array().unwrap().len(), 0);
-    for e in out["exclusions"].as_array().unwrap() {
-        assert_eq!(reason_codes(e), vec!["HOME_SERVICE_REQUIRED"]);
-    }
+    assert!(out["homeService"].is_null());
+    assert!(out["candidates"].as_array().unwrap().len() > 0);
 
-    // Not eligible: HOMEBOUND + NOTARY (home service only covers LEGAL_AID).
+    // Service mismatch: NOTARY is not the allowed home service. Here B is
+    // reachable, so candidates are returned and no home outcome appears.
     let req = json!({
         "serviceNeed": "NOTARY", "mobility": "HOMEBOUND",
-        "origin": {"x": 1, "y": 1}, "at": "2026-08-10T00:00:00Z"
+        "origin": {"x": 2, "y": 1}, "at": "2026-08-10T00:00:00Z"
     });
     let (_, out) = post_json(&t.app, "/route", &req).await;
+    assert!(out["homeService"].is_null());
+    assert_eq!(out["candidates"][0]["pointId"], "POINT-B");
+
+    // All points excluded but one of them only for SERVICE_UNAVAILABLE
+    // (POINT-A does not offer NOTARY): not a hard-condition sweep, so the
+    // degradation path stays closed and reports NOT_AVAILABLE.
+    let req = json!({
+        "serviceNeed": "NOTARY", "mobility": "HOMEBOUND",
+        "communication": ["SPEECH"],
+        "origin": {"x": 0, "y": 0}, "at": "2026-08-02T12:00:00Z"
+    });
+    let (_, out) = post_json(&t.app, "/route", &req).await;
+    assert_eq!(out["candidates"].as_array().unwrap().len(), 0);
     assert_eq!(out["homeService"]["eligible"], false);
     assert_eq!(out["homeService"]["reason"], "HOME_SERVICE_NOT_AVAILABLE");
-    for e in out["exclusions"].as_array().unwrap() {
-        assert_eq!(reason_codes(e), vec!["HOME_SERVICE_NOT_AVAILABLE"]);
+    assert!(out["homeService"]["booking"].is_null());
+    assert_eq!(
+        reason_codes(exclusion(&out, "POINT-A").unwrap()),
+        vec!["SERVICE_UNAVAILABLE"]
+    );
+}
+
+#[tokio::test]
+async fn home_service_equal_cost_slots_booked_in_stable_order() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    // SLOT-AM and SLOT-PM both cost 2 with capacity 1: the first request
+    // must take SLOT-AM (cost asc, slot id asc), the second SLOT-PM, and
+    // the third must find no capacity — without falling back to entity
+    // points that failed hard accessibility gates.
+    let (_, r1) = post_json(&t.app, "/route", &homebound_hard_blocked_req()).await;
+    let (_, r2) = post_json(&t.app, "/route", &homebound_hard_blocked_req()).await;
+    let (_, r3) = post_json(&t.app, "/route", &homebound_hard_blocked_req()).await;
+
+    assert_eq!(r1["homeService"]["booking"]["slotId"], "SLOT-AM");
+    assert_eq!(r2["homeService"]["booking"]["slotId"], "SLOT-PM");
+    assert_ne!(
+        r1["homeService"]["booking"]["bookingId"],
+        r2["homeService"]["booking"]["bookingId"]
+    );
+
+    assert!(r3["homeService"]["booking"].is_null());
+    assert_eq!(r3["homeService"]["reason"], "HOME_SERVICE_NO_CAPACITY");
+    assert_eq!(r3["homeService"]["eligible"], true);
+    assert_eq!(
+        r3["candidates"].as_array().unwrap().len(),
+        0,
+        "no fallback to hard-condition-failing entity points"
+    );
+    // Reason chain still fully preserved on the no-capacity response.
+    assert_eq!(
+        reason_codes(exclusion(&r3, "POINT-C").unwrap()),
+        vec!["TEMPORARILY_CLOSED"]
+    );
+}
+
+#[tokio::test]
+async fn home_service_capacity_exhausts_mid_batch() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    let batch = json!({"requests": [
+        homebound_hard_blocked_req(),
+        homebound_hard_blocked_req(),
+        homebound_hard_blocked_req()
+    ]});
+    let (status, out) = post_json(&t.app, "/route/batch", &batch).await;
+    assert_eq!(status, StatusCode::OK);
+    let snaps = out["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 3);
+    assert_eq!(snaps[0]["homeService"]["booking"]["slotId"], "SLOT-AM");
+    assert_eq!(snaps[1]["homeService"]["booking"]["slotId"], "SLOT-PM");
+    assert!(snaps[2]["homeService"]["booking"].is_null());
+    assert_eq!(snaps[2]["homeService"]["reason"], "HOME_SERVICE_NO_CAPACITY");
+    for s in snaps {
+        assert_eq!(s["catalogVersion"], "CAT-2026-07-31");
+        assert_eq!(s["candidates"].as_array().unwrap().len(), 0);
     }
+}
+
+#[tokio::test]
+async fn home_service_concurrent_booking_race_never_double_books() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    let mut racers = tokio::task::JoinSet::new();
+    for _ in 0..6 {
+        let app = t.app.clone();
+        let req = homebound_hard_blocked_req();
+        racers.spawn(async move { post_json(&app, "/route", &req).await });
+    }
+    let mut am = 0;
+    let mut pm = 0;
+    let mut no_capacity = 0;
+    let mut snapshot_ids = std::collections::HashSet::new();
+    while let Some(res) = racers.join_next().await {
+        let (status, out) = res.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        snapshot_ids.insert(out["snapshotId"].as_str().unwrap().to_string());
+        match out["homeService"]["booking"]["slotId"].as_str() {
+            Some("SLOT-AM") => am += 1,
+            Some("SLOT-PM") => pm += 1,
+            None => {
+                assert_eq!(out["homeService"]["reason"], "HOME_SERVICE_NO_CAPACITY");
+                no_capacity += 1;
+            }
+            other => panic!("unexpected slot {other:?}"),
+        }
+        assert_eq!(out["candidates"].as_array().unwrap().len(), 0);
+    }
+    assert_eq!((am, pm, no_capacity), (1, 1, 4), "capacity 1 per slot, no double-booking");
+    assert_eq!(snapshot_ids.len(), 6);
+}
+
+#[tokio::test]
+async fn home_service_capacity_is_scoped_by_catalog_version() {
+    let t = new_app();
+    import(&t.app, &fixture_catalog()).await;
+
+    // Exhaust SLOT-AM under v1.
+    let (_, r1) = post_json(&t.app, "/route", &homebound_hard_blocked_req()).await;
+    assert_eq!(r1["homeService"]["booking"]["slotId"], "SLOT-AM");
+
+    // Hot reload to a new version with the same slots: capacity is fresh
+    // (bookings are scoped per version) and the route cache was invalidated.
+    let mut v2 = fixture_catalog();
+    v2["catalogVersion"] = json!("CAT-2026-08-02");
+    import(&t.app, &v2).await;
+    let (_, r2) = post_json(&t.app, "/route", &homebound_hard_blocked_req()).await;
+    assert_eq!(r2["catalogVersion"], "CAT-2026-08-02");
+    assert_eq!(
+        r2["homeService"]["booking"]["slotId"], "SLOT-AM",
+        "new version has its own capacity ledger"
+    );
+
+    // Replaying the v1 snapshot still shows the v1 booking, untouched.
+    let (_, replay) = get(
+        &t.app,
+        &format!("/snapshots/{}", r1["snapshotId"].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(replay, r1);
+    assert_eq!(replay["catalogVersion"], "CAT-2026-07-31");
+    assert_eq!(replay["homeService"]["booking"]["slotId"], "SLOT-AM");
 }
 
 #[tokio::test]

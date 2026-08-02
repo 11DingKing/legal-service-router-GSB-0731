@@ -262,6 +262,12 @@ fn outcome_for(
         }
         None => {
             let o = routing::route(cat, normalized, uuid::Uuid::new_v4().to_string());
+            // Capacity-dependent home-service outcomes are computed fresh
+            // every time and are never cached: availability changes as
+            // bookings are made.
+            if o.home_service.as_ref().map(|h| h.eligible).unwrap_or(false) {
+                return finalize_home_service(st, cat, o, normalized, kind);
+            }
             st.route_cache.lock().unwrap().insert(key, o.clone());
             o
         }
@@ -287,6 +293,68 @@ fn route_one(st: &AppState, req: &RouteRequest) -> Result<RouteOutcome, ApiError
     let cat = cached_catalog(st, &version)?;
     let normalized = normalize_request(&cat, req)?;
     outcome_for(st, &cat, &normalized, "single")
+}
+
+/// Reserve home-service capacity for an eligible outcome inside one
+/// IMMEDIATE transaction: slot availability is checked and the booking row
+/// is inserted atomically, so concurrent requests can never double-book a
+/// slot. The chosen slot is the first with remaining capacity in the
+/// catalog's stable order (cost ascending, then slot id ascending). When no
+/// slot has capacity left the outcome reports HOME_SERVICE_NO_CAPACITY and
+/// `candidates` stays empty — there is deliberately no fallback to entity
+/// points that failed hard accessibility gates. The snapshot is persisted in
+/// the same transaction, so a stored booking always has its snapshot.
+fn finalize_home_service(
+    st: &AppState,
+    cat: &Arc<Catalog>,
+    mut outcome: RouteOutcome,
+    normalized: &NormalizedRequest,
+    kind: &str,
+) -> Result<RouteOutcome, ApiError> {
+    let mut conn = st.pool.get()?;
+    let tx = conn.transaction_with_behavior(r2d2_sqlite::rusqlite::TransactionBehavior::Immediate)?;
+
+    let mut booking = None;
+    if let Some(hs_cfg) = &cat.home_service {
+        for slot in &hs_cfg.slots {
+            if slot.to_ts <= outcome.request.at_epoch {
+                continue; // slot already over at the evaluation time
+            }
+            let used = db::count_bookings(&tx, &cat.version, &slot.slot_id)?;
+            if used < slot.capacity {
+                let b = HomeServiceBooking {
+                    booking_id: uuid::Uuid::new_v4().to_string(),
+                    slot_id: slot.slot_id.clone(),
+                    from: slot.from_rfc3339.clone(),
+                    to: slot.to_rfc3339.clone(),
+                    cost: slot.cost,
+                };
+                db::insert_booking(&tx, &b.booking_id, &cat.version, &slot.slot_id, &outcome.snapshot_id)?;
+                booking = Some(b);
+                break;
+            }
+        }
+    }
+    let hs = outcome.home_service.as_mut().expect("eligible home outcome");
+    match booking {
+        Some(b) => hs.booking = Some(b),
+        None => hs.reason = routing::REASON_HOME_NO_CAPACITY.to_string(),
+    }
+
+    let response_json =
+        serde_json::to_string(&outcome).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let request_json =
+        serde_json::to_string(normalized).map_err(|e| ApiError::Internal(e.to_string()))?;
+    db::save_snapshot(
+        &tx,
+        &outcome.snapshot_id,
+        &cat.version,
+        kind,
+        &request_json,
+        &response_json,
+    )?;
+    tx.commit()?;
+    Ok(outcome)
 }
 
 async fn route_single(

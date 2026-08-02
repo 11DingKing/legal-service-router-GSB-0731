@@ -111,6 +111,22 @@ pub fn init_schema(conn: &Connection) -> Result<(), DbError> {
             mobility TEXT NOT NULL,
             PRIMARY KEY (version, mobility)
         );
+        CREATE TABLE IF NOT EXISTS home_service_slots (
+            version  TEXT NOT NULL,
+            slot_id  TEXT NOT NULL,
+            from_ts  INTEGER NOT NULL,
+            to_ts    INTEGER NOT NULL,
+            capacity INTEGER NOT NULL,
+            cost     INTEGER NOT NULL,
+            PRIMARY KEY (version, slot_id)
+        );
+        CREATE TABLE IF NOT EXISTS bookings (
+            booking_id  TEXT PRIMARY KEY,
+            version     TEXT NOT NULL,
+            slot_id     TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS snapshots (
             snapshot_id  TEXT PRIMARY KEY,
             version      TEXT NOT NULL,
@@ -121,6 +137,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), DbError> {
         );
         CREATE INDEX IF NOT EXISTS idx_closures_point ON closures(version, point_id);
         CREATE INDEX IF NOT EXISTS idx_snapshots_version ON snapshots(version);
+        CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings(version, slot_id);
         ",
     )?;
     Ok(())
@@ -257,6 +274,34 @@ pub fn import_catalog(pool: &Pool, cat: &CatalogImport) -> Result<ImportResponse
         mob.dedup();
         for v in mob {
             m.execute(params![cat.catalog_version, v])?;
+        }
+        let mut sl = tx.prepare(
+            "INSERT INTO home_service_slots (version, slot_id, from_ts, to_ts, capacity, cost)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for s in &hs.slots {
+            let from_ts = parse_rfc3339(&s.from)?;
+            let to_ts = parse_rfc3339(&s.to)?;
+            if from_ts >= to_ts {
+                return Err(DbError::BadTime(format!(
+                    "home service slot {} has from >= to",
+                    s.slot_id
+                )));
+            }
+            if s.capacity < 0 {
+                return Err(DbError::BadTime(format!(
+                    "home service slot {} has negative capacity",
+                    s.slot_id
+                )));
+            }
+            sl.execute(params![
+                cat.catalog_version,
+                s.slot_id,
+                from_ts,
+                to_ts,
+                s.capacity,
+                s.cost
+            ])?;
         }
     }
 
@@ -443,10 +488,34 @@ pub fn load_catalog(conn: &Connection, version: &str) -> Result<Catalog, DbError
             for m in rows {
                 allowed_mobility.push(m?);
             }
+            let mut slots = Vec::new();
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT slot_id, from_ts, to_ts, capacity, cost FROM home_service_slots
+                     WHERE version = ?1 ORDER BY cost, slot_id",
+                )?;
+                let rows = stmt.query_map(params![version], |r| {
+                    let from_ts: i64 = r.get(1)?;
+                    let to_ts: i64 = r.get(2)?;
+                    Ok(HomeServiceSlot {
+                        slot_id: r.get(0)?,
+                        from_ts,
+                        to_ts,
+                        capacity: r.get(3)?,
+                        cost: r.get(4)?,
+                        from_rfc3339: format_rfc3339(from_ts),
+                        to_rfc3339: format_rfc3339(to_ts),
+                    })
+                })?;
+                for s in rows {
+                    slots.push(s?);
+                }
+            }
             Some(HomeService {
                 allowed_service,
                 allowed_mobility,
                 reason,
+                slots,
             })
         }
     };
@@ -487,6 +556,37 @@ pub fn save_snapshot(
             kind,
             request_json,
             response_json,
+            format_rfc3339(chrono::Utc::now().timestamp())
+        ],
+    )?;
+    Ok(())
+}
+
+/// Count existing bookings for one slot of one catalog version. Callers run
+/// this inside an IMMEDIATE transaction so the check-and-book is atomic.
+pub fn count_bookings(conn: &Connection, version: &str, slot_id: &str) -> Result<i64, DbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM bookings WHERE version = ?1 AND slot_id = ?2",
+        params![version, slot_id],
+        |r| r.get(0),
+    )?)
+}
+
+pub fn insert_booking(
+    conn: &Connection,
+    booking_id: &str,
+    version: &str,
+    slot_id: &str,
+    snapshot_id: &str,
+) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO bookings (booking_id, version, slot_id, snapshot_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            booking_id,
+            version,
+            slot_id,
+            snapshot_id,
             format_rfc3339(chrono::Utc::now().timestamp())
         ],
     )?;

@@ -71,6 +71,20 @@ pub struct HomeServiceImport {
     #[serde(rename = "allowedMobility", default)]
     pub allowed_mobility: Vec<String>,
     pub reason: String,
+    #[serde(default)]
+    pub slots: Vec<HomeServiceSlotImport>,
+}
+
+/// A bookable home-service appointment window with a capacity limit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HomeServiceSlotImport {
+    #[serde(rename = "slotId")]
+    pub slot_id: String,
+    pub from: String,
+    pub to: String,
+    pub capacity: i64,
+    #[serde(default)]
+    pub cost: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +139,18 @@ pub struct HomeService {
     pub allowed_service: String,
     pub allowed_mobility: Vec<String>, // sorted, deduped
     pub reason: String,
+    pub slots: Vec<HomeServiceSlot>, // sorted by (cost, slot id)
+}
+
+#[derive(Debug, Clone)]
+pub struct HomeServiceSlot {
+    pub slot_id: String,
+    pub from_ts: i64,
+    pub to_ts: i64, // a slot is bookable while `at` < to_ts
+    pub capacity: i64,
+    pub cost: i64,
+    pub from_rfc3339: String,
+    pub to_rfc3339: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,9 +248,23 @@ pub struct Exclusion {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HomeServiceBooking {
+    #[serde(rename = "bookingId")]
+    pub booking_id: String,
+    #[serde(rename = "slotId")]
+    pub slot_id: String,
+    pub from: String,
+    pub to: String,
+    pub cost: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HomeServiceOutcome {
     pub eligible: bool,
     pub reason: String,
+    /// Present when capacity was atomically reserved for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub booking: Option<HomeServiceBooking>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

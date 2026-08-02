@@ -10,6 +10,7 @@ pub const REASON_CLOSED: &str = "TEMPORARILY_CLOSED";
 pub const REASON_DEGRADED: &str = "CAPABILITY_DEGRADED";
 pub const REASON_HOME_REQUIRED: &str = "HOME_SERVICE_REQUIRED";
 pub const REASON_HOME_UNAVAILABLE: &str = "HOME_SERVICE_NOT_AVAILABLE";
+pub const REASON_HOME_NO_CAPACITY: &str = "HOME_SERVICE_NO_CAPACITY";
 
 /// Closures and capability degradations are active on the half-open interval
 /// [from, to): the "from" instant is affected, the "to" instant is normal.
@@ -51,40 +52,6 @@ pub fn required_access(cat: &Catalog, req: &NormalizedRequest) -> Vec<String> {
 
 pub fn route(cat: &Catalog, req: &NormalizedRequest, snapshot_id: String) -> RouteOutcome {
     let required = required_access(cat, req);
-
-    // Homebound applicants cannot travel: every physical point is excluded.
-    if let Some(hs) = &cat.home_service {
-        if hs.allowed_mobility.iter().any(|m| m == &req.mobility) {
-            let eligible = hs.allowed_service == req.service_need;
-            let reason = if eligible {
-                hs.reason.clone()
-            } else {
-                REASON_HOME_UNAVAILABLE.to_string()
-            };
-            let code = if eligible {
-                REASON_HOME_REQUIRED
-            } else {
-                REASON_HOME_UNAVAILABLE
-            };
-            let exclusions = cat
-                .points
-                .iter()
-                .map(|p| Exclusion {
-                    point_id: p.id.clone(),
-                    reasons: vec![ExclusionReason::simple(code)],
-                })
-                .collect();
-            return RouteOutcome {
-                snapshot_id,
-                catalog_version: cat.version.clone(),
-                cost_formula: cat.cost_formula.clone(),
-                request: req.clone(),
-                candidates: Vec::new(),
-                exclusions,
-                home_service: Some(HomeServiceOutcome { eligible, reason }),
-            };
-        }
-    }
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut exclusions: Vec<Exclusion> = Vec::new();
@@ -170,6 +137,8 @@ pub fn route(cat: &Catalog, req: &NormalizedRequest, snapshot_id: String) -> Rou
     });
     exclusions.sort_by(|a, b| a.point_id.cmp(&b.point_id));
 
+    let home_service = home_service_outcome(cat, req, &candidates, &exclusions);
+
     RouteOutcome {
         snapshot_id,
         catalog_version: cat.version.clone(),
@@ -177,7 +146,51 @@ pub fn route(cat: &Catalog, req: &NormalizedRequest, snapshot_id: String) -> Rou
         request: req.clone(),
         candidates,
         exclusions,
-        home_service: None,
+        home_service,
+    }
+}
+
+/// Hard-condition reason codes: failures of mandatory capabilities or of
+/// availability events. The home-service degradation path triggers only when
+/// every entity point failed exclusively on such conditions — a point that
+/// merely does not offer the service is not an accessibility failure.
+fn is_hard_condition(code: &str) -> bool {
+    matches!(code, REASON_MISSING_ACCESS | REASON_CLOSED | REASON_DEGRADED)
+}
+
+/// Home service is a degradation path, never a shortcut: it is offered only
+/// when the applicant's mobility is registered for it AND no entity point
+/// survived the hard gates. The entity exclusion chains are left untouched
+/// so the caller can see exactly why each physical point failed.
+fn home_service_outcome(
+    cat: &Catalog,
+    req: &NormalizedRequest,
+    candidates: &[Candidate],
+    exclusions: &[Exclusion],
+) -> Option<HomeServiceOutcome> {
+    let hs = cat.home_service.as_ref()?;
+    if !hs.allowed_mobility.iter().any(|m| m == &req.mobility) {
+        return None;
+    }
+    if !candidates.is_empty() {
+        return None;
+    }
+    let hard_only = !exclusions.is_empty()
+        && exclusions.iter().all(|e| {
+            !e.reasons.is_empty() && e.reasons.iter().all(|r| is_hard_condition(&r.code))
+        });
+    if hs.allowed_service == req.service_need && hard_only {
+        Some(HomeServiceOutcome {
+            eligible: true,
+            reason: hs.reason.clone(),
+            booking: None,
+        })
+    } else {
+        Some(HomeServiceOutcome {
+            eligible: false,
+            reason: REASON_HOME_UNAVAILABLE.to_string(),
+            booking: None,
+        })
     }
 }
 

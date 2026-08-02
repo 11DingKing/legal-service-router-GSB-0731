@@ -14,7 +14,7 @@ Axum, SQLite (bundled, WAL). No external map or route API.
 
 ```bash
 cargo build
-cargo test                 # 18 tests: unit + end-to-end API tests
+cargo test                 # 22 tests: unit + end-to-end API tests
 cargo run -- --import materials/service-catalog.json
 ```
 
@@ -31,6 +31,8 @@ Created automatically on startup (`db::init_schema`):
 - `closures(version, event_id, point_id, from_ts, to_ts)` — epoch seconds.
 - `capability_events(version, event_id, point_id, capability, from_ts, to_ts)` — temporary capability degradations, epoch seconds.
 - `home_service(version, allowed_service, reason)` + `home_service_mobility(version, mobility)`
+- `home_service_slots(version, slot_id, from_ts, to_ts, capacity, cost)` — bookable home-service appointment windows.
+- `bookings(booking_id PK, version, slot_id, snapshot_id, created_at)` — capacity reservations, scoped per catalog version.
 - `snapshots(snapshot_id PK, version, kind, request_json, response_json, created_at)` — immutable routing snapshots.
 
 ## Endpoints
@@ -59,7 +61,8 @@ Route request:
 
 Response contains `snapshotId`, `catalogVersion`, the normalized request,
 `candidates` (with `totalCost` and `costBreakdown`), `exclusions` (reason
-chain per point), and `homeService` when the applicant is homebound.
+chain per point), and `homeService` for homebound applicants (with a
+`booking` when capacity was reserved).
 
 ```bash
 curl -X POST localhost:8080/route -H 'content-type: application/json' -d '{
@@ -100,11 +103,35 @@ applicants who actually require the degraded capability — a wheelchair user
 who does not need `SIGN_INTERPRETER` still reaches POINT-C during DEGRADE-01.
 Outside every event window, results are identical to the pre-window baseline.
 
-**Home service**: if `mobility` is in `homeService.allowedMobility`, no
-physical point is reachable. If `serviceNeed == allowedService`, the outcome
-is `homeService: {eligible: true, reason: "HOME_SERVICE_REQUIRED"}` and every
-point is excluded with `HOME_SERVICE_REQUIRED`; otherwise `eligible: false`
-with `HOME_SERVICE_NOT_AVAILABLE`.
+**Home service (degradation path with booking capacity)**: home service is
+never a shortcut around entity routing. Every request first evaluates all
+entity points with the normal hard gates, and the exclusion reason chains are
+always preserved verbatim in the response. The path triggers only when **all**
+of the following hold:
+
+1. `mobility` is in `homeService.allowedMobility` (fixture: `HOMEBOUND`),
+2. `serviceNeed == homeService.allowedService` (fixture: `LEGAL_AID`),
+3. no entity point survived — and every exclusion chain consists solely of
+   hard conditions (`MISSING_REQUIRED_ACCESS`, `TEMPORARILY_CLOSED`,
+   `CAPABILITY_DEGRADED`). A point excluded merely for `SERVICE_UNAVAILABLE`
+   means the request is a service mismatch, not an accessibility failure, and
+   the path stays closed (`HOME_SERVICE_NOT_AVAILABLE`).
+
+If any entity candidate exists, the candidates are returned and
+`homeService` is null.
+
+When the path triggers, capacity is reserved atomically: slots (fixture:
+`SLOT-AM`/`SLOT-PM`, both cost 2, capacity 1, on 2026-08-06) are scanned in
+stable order (cost ascending, then slot id ascending) and the first slot with
+`at < to` and remaining capacity is booked inside one IMMEDIATE transaction
+together with the snapshot — concurrent requests can never double-book
+(`home_service_concurrent_booking_race_never_double_books`). Bookings are
+scoped per catalog version, so a hot reload starts a fresh capacity ledger
+while old snapshot replays still show their original booking. When no slot
+has capacity left, the outcome is `HOME_SERVICE_NO_CAPACITY` with
+`booking: null` and an **empty** candidate list — the router never falls back
+to entity points that failed hard accessibility gates. Capacity-dependent
+outcomes bypass the route cache entirely.
 
 **Tie-breaking** (from the catalog `tieBreak`): `totalCost` ascending, then
 point id ascending. Exclusions are ordered by point id. Combined with
