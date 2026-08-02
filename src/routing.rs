@@ -79,14 +79,39 @@ pub struct RouteResult {
     pub evaluated_at: DateTime<Utc>,
     pub candidates: Vec<Candidate>,
     pub exclusions: Vec<Exclusion>,
-    /// Applied when the applicant is home-service eligible; see [`HomeService`].
+    /// Set only when the applicant qualifies for the home-service fallback (see
+    /// [`route`]). The exclusion chain above is always preserved alongside it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home_service: Option<HomeServiceOutcome>,
 }
 
+/// Status of the home-service fallback for an eligible applicant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HomeServiceStatus {
+    /// Eligible for the home fallback; appointment capacity not yet resolved.
+    /// This is the state produced by the pure [`route`] function; the store
+    /// resolves it to `Reserved` or `NoCapacity`.
+    Eligible,
+    /// A concrete appointment slot was reserved.
+    Reserved,
+    /// Eligible, but every home-visit slot is already at capacity. The result
+    /// still lists zero physical candidates — capacity shortage never falls
+    /// back to an inaccessible/closed physical point.
+    NoCapacity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HomeServiceOutcome {
+    /// The catalog-defined reason code, e.g. `HOME_SERVICE_REQUIRED`.
     pub reason: String,
+    pub status: HomeServiceStatus,
+    /// The reserved slot id (present only when `status == Reserved`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    /// The reserved slot's cost (present only when `status == Reserved`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_cost: Option<i64>,
 }
 
 /// Resolve the set of mandatory access capabilities for an applicant given the
@@ -116,21 +141,6 @@ pub fn route(catalog: &Catalog, req: &RouteRequest) -> RouteResult {
     // Normalized communication list for the persisted, order-independent record.
     let communication: Vec<String> =
         req.communication.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
-
-    // Home-service eligibility: a homebound applicant requesting the allowed
-    // service is routed home instead of to a physical point.
-    let home_service = catalog.home_service.as_ref().and_then(|hs| {
-        let mobility_ok = req
-            .mobility
-            .as_ref()
-            .map(|m| hs.allowed_mobility.contains(m))
-            .unwrap_or(false);
-        if mobility_ok && req.service == hs.allowed_service {
-            Some(HomeServiceOutcome { reason: hs.reason.clone() })
-        } else {
-            None
-        }
-    });
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut exclusions: Vec<Exclusion> = Vec::new();
@@ -212,6 +222,34 @@ pub fn route(catalog: &Catalog, req: &RouteRequest) -> RouteResult {
             .total
             .cmp(&b.cost.total)
             .then_with(|| a.point_id.cmp(&b.point_id))
+    });
+
+    // Home-service fallback (round 3). It is a *degraded path*, entered ONLY
+    // when all three hold:
+    //   1. the applicant's mobility is the catalog's allowed home mobility
+    //      (`HOMEBOUND`),
+    //   2. the requested service is the allowed home service (`LEGAL_AID`),
+    //   3. every physical point was excluded (no surviving candidate).
+    // The physical exclusion chain is preserved untouched. Capacity is *not*
+    // resolved here (that is stateful and belongs to the store); the pure
+    // function only marks eligibility with status `Eligible`.
+    let home_service = catalog.home_service.as_ref().and_then(|hs| {
+        let mobility_ok = req
+            .mobility
+            .as_ref()
+            .map(|m| hs.allowed_mobility.contains(m))
+            .unwrap_or(false);
+        let eligible = mobility_ok && req.service == hs.allowed_service && candidates.is_empty();
+        if eligible {
+            Some(HomeServiceOutcome {
+                reason: hs.reason.clone(),
+                status: HomeServiceStatus::Eligible,
+                slot_id: None,
+                slot_cost: None,
+            })
+        } else {
+            None
+        }
     });
 
     RouteResult {

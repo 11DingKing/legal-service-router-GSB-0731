@@ -88,6 +88,17 @@ pub struct RawHomeService {
     #[serde(rename = "allowedMobility", default)]
     pub allowed_mobility: Vec<String>,
     pub reason: String,
+    /// Bookable home-visit time slots with finite appointment capacity.
+    #[serde(default)]
+    pub slots: Vec<RawHomeSlot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawHomeSlot {
+    #[serde(rename = "slotId")]
+    pub slot_id: String,
+    pub cost: i64,
+    pub capacity: i64,
 }
 
 /// A normalized service point. All capability collections are sorted sets so
@@ -142,6 +153,19 @@ pub struct HomeService {
     pub allowed_service: String,
     pub allowed_mobility: BTreeSet<String>,
     pub reason: String,
+    /// Bookable slots, ordered by the same tie-break as physical candidates:
+    /// cost ascending, then slot id ascending. Deterministic regardless of the
+    /// order slots were declared in the catalog.
+    pub slots: Vec<HomeSlot>,
+}
+
+/// A home-visit appointment slot definition (immutable). Live remaining
+/// capacity is tracked separately in the store, not in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeSlot {
+    pub slot_id: String,
+    pub cost: i64,
+    pub capacity: i64,
 }
 
 /// Immutable, normalized catalog. Shared as `Arc<Catalog>`; a single routing
@@ -222,10 +246,21 @@ impl Catalog {
             list.sort_by(|a, b| a.event_id.cmp(&b.event_id));
         }
 
-        let home_service = raw.home_service.map(|h| HomeService {
-            allowed_service: h.allowed_service,
-            allowed_mobility: h.allowed_mobility.into_iter().collect(),
-            reason: h.reason,
+        let home_service = raw.home_service.map(|h| {
+            let mut slots: Vec<HomeSlot> = h
+                .slots
+                .into_iter()
+                .map(|s| HomeSlot { slot_id: s.slot_id, cost: s.cost, capacity: s.capacity })
+                .collect();
+            // Deterministic order: cost ascending, then slot id ascending —
+            // the same tie-break rule physical candidates use.
+            slots.sort_by(|a, b| a.cost.cmp(&b.cost).then_with(|| a.slot_id.cmp(&b.slot_id)));
+            HomeService {
+                allowed_service: h.allowed_service,
+                allowed_mobility: h.allowed_mobility.into_iter().collect(),
+                reason: h.reason,
+                slots,
+            }
         });
 
         Ok(Catalog {

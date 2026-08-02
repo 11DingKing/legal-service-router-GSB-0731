@@ -10,6 +10,6 @@
   "tieBreak": ["totalCost ascending", "point id ascending"],
   "closures": [{"eventId": "CLOSE-01", "pointId": "POINT-C", "from": "2026-08-02T00:00:00Z", "to": "2026-08-04T00:00:00Z"}],
   "degradations": [{"eventId": "DEGRADE-01", "pointId": "POINT-C", "capability": "STEP_FREE", "from": "2026-08-03T00:00:00Z", "to": "2026-08-05T00:00:00Z"}],
-  "homeService": {"allowedService": "LEGAL_AID", "allowedMobility": ["HOMEBOUND"], "reason": "HOME_SERVICE_REQUIRED"}
+  "homeService": {"allowedService": "LEGAL_AID", "allowedMobility": ["HOMEBOUND"], "reason": "HOME_SERVICE_REQUIRED", "slots": [{"slotId": "SLOT-AM", "cost": 5, "capacity": 1}, {"slotId": "SLOT-PM", "cost": 5, "capacity": 1}, {"slotId": "SLOT-EVE", "cost": 8, "capacity": 2}]}
 }
 

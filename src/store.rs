@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
 use crate::model::{Catalog, Closure, Degradation, RawCatalog};
-use crate::routing::{RouteRequest, RouteResult};
+use crate::routing::{HomeServiceStatus, RouteRequest, RouteResult};
 
 /// Snapshot rows returned on replay.
 #[derive(Debug, Clone)]
@@ -197,6 +197,13 @@ impl Store {
                     tx.execute(
                         "INSERT INTO home_mobility(version, mobility) VALUES (?1,?2)",
                         params![version, m],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                for s in &h.slots {
+                    tx.execute(
+                        "INSERT INTO home_slots(version, slot_id, cost, capacity) VALUES (?1,?2,?3,?4)",
+                        params![version, s.slot_id, s.cost, s.capacity],
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -449,6 +456,78 @@ impl Store {
         Ok(id)
     }
 
+    /// Resolve appointment capacity for an eligible home-service result.
+    ///
+    /// Called after the pure [`route`](crate::routing::route) has already
+    /// decided eligibility (`status == Eligible`). This is the only place
+    /// capacity is consumed, and it is atomic: the whole reserve-or-reject
+    /// decision runs inside a single SQLite transaction under the connection
+    /// mutex, so concurrent requests never double-book a slot and capacity can
+    /// genuinely run out mid-batch.
+    ///
+    /// Slots are tried in `(cost ascending, slot id ascending)` order, so two
+    /// equal-cost slots compete deterministically (lower id wins). On success
+    /// the result is mutated to `Reserved` with the chosen slot; if every slot
+    /// is full it becomes `NoCapacity`. Physical candidates are never touched —
+    /// capacity shortage cannot resurrect an excluded, inaccessible point.
+    pub fn resolve_home_capacity(&self, result: &mut RouteResult) -> Result<(), String> {
+        let hs = match &result.home_service {
+            Some(h) if h.status == HomeServiceStatus::Eligible => h,
+            _ => return Ok(()), // nothing to resolve
+        };
+        let reason = hs.reason.clone();
+        let version = result.catalog_version.clone();
+
+        // Candidate slots (ordered) for this version from the immutable catalog.
+        let slots = {
+            let cache = self.cache.read().unwrap();
+            match cache.versions.get(&version).and_then(|c| c.home_service.as_ref()) {
+                Some(home) => home.slots.clone(),
+                None => Vec::new(),
+            }
+        };
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut reserved: Option<(String, i64)> = None;
+        for slot in &slots {
+            let used: i64 = tx
+                .query_row(
+                    "SELECT reserved FROM home_reservations WHERE version = ?1 AND slot_id = ?2",
+                    params![version, slot.slot_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if used < slot.capacity {
+                tx.execute(
+                    "INSERT INTO home_reservations(version, slot_id, reserved) VALUES (?1,?2,1)
+                     ON CONFLICT(version, slot_id) DO UPDATE SET reserved = reserved + 1",
+                    params![version, slot.slot_id],
+                )
+                .map_err(|e| e.to_string())?;
+                reserved = Some((slot.slot_id.clone(), slot.cost));
+                break;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+
+        result.home_service = Some(match reserved {
+            Some((slot_id, cost)) => crate::routing::HomeServiceOutcome {
+                reason,
+                status: HomeServiceStatus::Reserved,
+                slot_id: Some(slot_id),
+                slot_cost: Some(cost),
+            },
+            None => crate::routing::HomeServiceOutcome {
+                reason: "HOME_SERVICE_NO_CAPACITY".to_string(),
+                status: HomeServiceStatus::NoCapacity,
+                slot_id: None,
+                slot_cost: None,
+            },
+        });
+        Ok(())
+    }
+
     /// Replay a stored snapshot verbatim. Never re-runs routing, so it cannot
     /// pick up catalog changes made after the snapshot was taken.
     pub fn get_snapshot(&self, snapshot_id: &str) -> Result<Option<SnapshotRecord>, String> {
@@ -486,7 +565,7 @@ impl Store {
 
     /// Build a normalized [`Catalog`] for `version` from the relational tables.
     fn build_catalog(conn: &Connection, version: &str) -> Result<Catalog, String> {
-        use crate::model::{Grid, HomeService, Point};
+        use crate::model::{Grid, HomeService, HomeSlot, Point};
         use std::collections::{BTreeMap, BTreeSet};
 
         let (cost_formula, tie_break_json): (String, String) = conn
@@ -663,7 +742,22 @@ impl Store {
                     for m in rows {
                         allowed_mobility.insert(m.map_err(|e| e.to_string())?);
                     }
-                    Some(HomeService { allowed_service, allowed_mobility, reason })
+                    // Slots ordered by (cost, slot id) for deterministic
+                    // reservation preference.
+                    let mut slots: Vec<HomeSlot> = Vec::new();
+                    let mut sstmt = conn
+                        .prepare("SELECT slot_id, cost, capacity FROM home_slots WHERE version = ?1 ORDER BY cost, slot_id")
+                        .map_err(|e| e.to_string())?;
+                    let srows = sstmt
+                        .query_map(params![version], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    for row in srows {
+                        let (slot_id, cost, capacity) = row.map_err(|e| e.to_string())?;
+                        slots.push(HomeSlot { slot_id, cost, capacity });
+                    }
+                    Some(HomeService { allowed_service, allowed_mobility, reason, slots })
                 }
                 None => None,
             }
@@ -775,6 +869,24 @@ CREATE TABLE IF NOT EXISTS home_mobility (
     version  TEXT NOT NULL,
     mobility TEXT NOT NULL,
     PRIMARY KEY (version, mobility)
+);
+
+CREATE TABLE IF NOT EXISTS home_slots (
+    version  TEXT NOT NULL,
+    slot_id  TEXT NOT NULL,
+    cost     INTEGER NOT NULL,
+    capacity INTEGER NOT NULL,
+    PRIMARY KEY (version, slot_id)
+);
+
+-- Live appointment reservations, tracked per (version, slot). Kept out of the
+-- immutable catalog so closure/degradation rebuilds never disturb capacity and
+-- a version switch starts fresh.
+CREATE TABLE IF NOT EXISTS home_reservations (
+    version  TEXT NOT NULL,
+    slot_id  TEXT NOT NULL,
+    reserved INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (version, slot_id)
 );
 
 CREATE TABLE IF NOT EXISTS active_version (

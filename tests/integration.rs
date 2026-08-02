@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use legal_service_router::model::Catalog;
-use legal_service_router::routing::{route, RouteRequest};
+use legal_service_router::routing::{route, HomeServiceStatus, RouteRequest};
 use legal_service_router::store::Store;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -196,18 +196,45 @@ fn input_order_does_not_change_output() {
 }
 
 #[test]
-fn home_service_eligibility() {
+fn home_service_is_fallback_only() {
+    // Round 3 semantics: home service is a *degraded fallback*, entered only
+    // when every physical point is excluded. A HOMEBOUND + LEGAL_AID applicant
+    // with a reachable physical point gets NO home outcome.
     let cat = fixture_catalog();
-    let req = RouteRequest {
-        origin: [9, 9],
+    let with_physical = RouteRequest {
+        origin: [1, 1], // POINT-A offers LEGAL_AID and needs no access here
         service: "LEGAL_AID".into(),
         mobility: Some("HOMEBOUND".into()),
         communication: vec![],
         at: Some(ts("2026-01-01T00:00:00Z")),
     };
-    let res = route(&cat, &req);
-    let hs = res.home_service.expect("home service applied");
+    let res = route(&cat, &with_physical);
+    assert!(res.candidates.iter().any(|c| c.point_id == "POINT-A"));
+    assert!(res.home_service.is_none(), "home service must not trigger when a point is reachable");
+
+    // Force every physical point out. A HOMEBOUND applicant maps to no hard
+    // access requirement, so we exclude all points via communication needs:
+    // requiring SIGN_INTERPRETER (HEARING) *and* TEXT_COMMUNICATION (SPEECH):
+    //   POINT-A has TEXT_COMMUNICATION but lacks SIGN_INTERPRETER -> excluded
+    //   POINT-B has SIGN_INTERPRETER but lacks TEXT_COMMUNICATION -> excluded
+    //   POINT-C has both but is CLOSED in this window                -> excluded
+    let all_excluded = RouteRequest {
+        origin: [0, 0],
+        service: "LEGAL_AID".into(),
+        mobility: Some("HOMEBOUND".into()),
+        communication: vec!["HEARING".into(), "SPEECH".into()],
+        at: Some(ts("2026-08-03T00:00:00Z")), // POINT-C closed
+    };
+    let res2 = route(&cat, &all_excluded);
+    assert!(res2.candidates.is_empty());
+    let hs = res2.home_service.expect("home fallback eligible");
     assert_eq!(hs.reason, "HOME_SERVICE_REQUIRED");
+    assert_eq!(hs.status, HomeServiceStatus::Eligible);
+    // Pure routing does not resolve capacity.
+    assert!(hs.slot_id.is_none());
+    // Physical exclusion chain is preserved.
+    assert!(res2.exclusions.iter().any(|e| e.point_id == "POINT-C"
+        && e.reasons.iter().any(|r| r == "CLOSED:CLOSE-01")));
 }
 
 // ---- closures: half-open semantics -----------------------------------------
@@ -809,4 +836,231 @@ async fn batch_pinned_to_single_version_during_degradation_reload() {
     reloader.await.unwrap();
     batcher.await.unwrap();
 }
+
+// ============================================================================
+// Round 3: home-service fallback + appointment capacity
+// ============================================================================
+//
+// Home service is a strict fallback: it triggers only for HOMEBOUND + LEGAL_AID
+// applicants when *every* physical point is excluded. Capacity is finite,
+// per-version state that resets on a version switch and can run out mid-batch,
+// but a capacity shortage never resurrects an inaccessible physical point.
+
+/// A catalog whose only physical point can never serve a LEGAL_AID request
+/// (it offers MEDIATION only), so a HOMEBOUND + LEGAL_AID applicant always
+/// falls through to the home path. `slots` lets each test size capacity.
+fn home_only_catalog(version: &str, slots: Value) -> Value {
+    json!({
+        "catalogVersion": version,
+        "points": [
+            {"id": "POINT-X", "grid": [0,0], "services": ["MEDIATION"], "access": [], "barrierPenalty": 0}
+        ],
+        "hardRequirements": {},
+        "tieBreak": ["totalCost ascending", "point id ascending"],
+        "homeService": {
+            "allowedService": "LEGAL_AID",
+            "allowedMobility": ["HOMEBOUND"],
+            "reason": "HOME_SERVICE_REQUIRED",
+            "slots": slots
+        }
+    })
+}
+
+fn homebound_legal_aid() -> Value {
+    json!({"origin": [0,0], "service": "LEGAL_AID", "mobility": "HOMEBOUND"})
+}
+
+async fn import_active(store: Arc<Store>, catalog: Value) {
+    let (st, _) = call(
+        store.clone(),
+        "POST",
+        "/catalog/import",
+        json!({"catalog": catalog, "activate": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn home_capacity_exhausts_mid_batch() {
+    // Two slots, capacity 1 each -> 2 appointments total. A batch of 3 identical
+    // homebound requests must reserve the first two and reject the third with
+    // HOME_SERVICE_NO_CAPACITY — never falling back to POINT-X.
+    let store = Arc::new(Store::open(":memory:").unwrap());
+    import_active(
+        store.clone(),
+        home_only_catalog(
+            "CAP-1",
+            json!([
+                {"slotId": "SLOT-AM", "cost": 5, "capacity": 1},
+                {"slotId": "SLOT-PM", "cost": 5, "capacity": 1}
+            ]),
+        ),
+    )
+    .await;
+
+    let (st, body) = call(
+        store.clone(),
+        "POST",
+        "/route/batch",
+        json!({"requests": [homebound_legal_aid(), homebound_legal_aid(), homebound_legal_aid()]}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+
+    // Item 0: reserves SLOT-AM (equal cost, lowest id).
+    assert_eq!(items[0]["result"]["home_service"]["status"], "RESERVED");
+    assert_eq!(items[0]["result"]["home_service"]["slot_id"], "SLOT-AM");
+    // Item 1: reserves SLOT-PM.
+    assert_eq!(items[1]["result"]["home_service"]["status"], "RESERVED");
+    assert_eq!(items[1]["result"]["home_service"]["slot_id"], "SLOT-PM");
+    // Item 2: capacity exhausted mid-batch.
+    assert_eq!(items[2]["result"]["home_service"]["status"], "NO_CAPACITY");
+    assert_eq!(items[2]["result"]["home_service"]["reason"], "HOME_SERVICE_NO_CAPACITY");
+
+    // Crucial: no item ever lists the inaccessible physical point as a candidate.
+    for it in items {
+        assert!(it["result"]["candidates"].as_array().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn two_equal_cost_slots_compete_deterministically() {
+    // Two equal-cost slots: the lower slot id must always win first, regardless
+    // of the order they were declared in the catalog.
+    let store = Arc::new(Store::open(":memory:").unwrap());
+    import_active(
+        store.clone(),
+        home_only_catalog(
+            "CAP-TIE",
+            // Declared PM-before-AM on purpose; normalization sorts by (cost,id).
+            json!([
+                {"slotId": "SLOT-PM", "cost": 5, "capacity": 1},
+                {"slotId": "SLOT-AM", "cost": 5, "capacity": 1}
+            ]),
+        ),
+    )
+    .await;
+
+    let (_st, first) = call(store.clone(), "POST", "/route", homebound_legal_aid()).await;
+    assert_eq!(first["result"]["home_service"]["slot_id"], "SLOT-AM");
+    assert_eq!(first["result"]["home_service"]["slot_cost"], 5);
+
+    let (_st, second) = call(store.clone(), "POST", "/route", homebound_legal_aid()).await;
+    assert_eq!(second["result"]["home_service"]["slot_id"], "SLOT-PM");
+
+    // Third: both equal-cost slots full -> no capacity (stable, explicit).
+    let (_st, third) = call(store.clone(), "POST", "/route", homebound_legal_aid()).await;
+    assert_eq!(third["result"]["home_service"]["status"], "NO_CAPACITY");
+}
+
+#[tokio::test]
+async fn version_switch_resets_capacity() {
+    // Exhaust capacity on version A, then import+activate version B (same shape,
+    // fresh reservations). The next request reserves again on B.
+    let store = Arc::new(Store::open(":memory:").unwrap());
+    import_active(
+        store.clone(),
+        home_only_catalog("VER-A", json!([{"slotId": "SLOT-AM", "cost": 5, "capacity": 1}])),
+    )
+    .await;
+
+    // Consume the single slot on VER-A.
+    let (_st, a1) = call(store.clone(), "POST", "/route", homebound_legal_aid()).await;
+    assert_eq!(a1["result"]["home_service"]["status"], "RESERVED");
+    let (_st, a2) = call(store.clone(), "POST", "/route", homebound_legal_aid()).await;
+    assert_eq!(a2["result"]["home_service"]["status"], "NO_CAPACITY");
+
+    // Switch to a fresh version.
+    import_active(
+        store.clone(),
+        home_only_catalog("VER-B", json!([{"slotId": "SLOT-AM", "cost": 5, "capacity": 1}])),
+    )
+    .await;
+
+    let (_st, b1) = call(store.clone(), "POST", "/route", homebound_legal_aid()).await;
+    assert_eq!(b1["result"]["catalog_version"], "VER-B");
+    assert_eq!(b1["result"]["home_service"]["status"], "RESERVED", "capacity resets per version");
+    assert_eq!(b1["result"]["home_service"]["slot_id"], "SLOT-AM");
+}
+
+#[tokio::test]
+async fn no_capacity_never_falls_back_to_inaccessible_point() {
+    // A wheelchair + HOMEBOUND applicant: the physical point exists but lacks
+    // STEP_FREE, so it is a hard exclusion. With zero home capacity the result
+    // must be NO_CAPACITY with an empty candidate list — the inaccessible point
+    // is never offered as a fallback.
+    let store = Arc::new(Store::open(":memory:").unwrap());
+    let catalog = json!({
+        "catalogVersion": "SAFE-1",
+        "points": [
+            // Offers LEGAL_AID but has NO STEP_FREE -> excluded for a wheelchair.
+            {"id": "POINT-NOFREE", "grid": [0,0], "services": ["LEGAL_AID"], "access": [], "barrierPenalty": 0}
+        ],
+        "hardRequirements": {"WHEELCHAIR": "STEP_FREE", "HEARING": "SIGN_INTERPRETER"},
+        "tieBreak": ["totalCost ascending", "point id ascending"],
+        "homeService": {
+            "allowedService": "LEGAL_AID",
+            "allowedMobility": ["HOMEBOUND"],
+            "reason": "HOME_SERVICE_REQUIRED",
+            "slots": [{"slotId": "SLOT-AM", "cost": 5, "capacity": 0}]
+        }
+    });
+    import_active(store.clone(), catalog).await;
+
+    let (_st, body) = call(
+        store.clone(),
+        "POST",
+        "/route",
+        json!({"origin":[0,0],"service":"LEGAL_AID","mobility":"HOMEBOUND","communication":["HEARING"]}),
+    )
+    .await;
+    // HOMEBOUND doesn't map to a hard cap, but HEARING needs SIGN_INTERPRETER,
+    // which POINT-NOFREE lacks -> excluded. Zero slot capacity -> NO_CAPACITY.
+    let hs = &body["result"]["home_service"];
+    assert_eq!(hs["status"], "NO_CAPACITY");
+    assert_eq!(hs["reason"], "HOME_SERVICE_NO_CAPACITY");
+    // The inaccessible point stays excluded, candidates empty.
+    assert!(body["result"]["candidates"].as_array().unwrap().is_empty());
+    assert!(body["result"]["exclusions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["point_id"] == "POINT-NOFREE"));
+}
+
+#[tokio::test]
+async fn concurrent_reservations_never_overbook() {
+    // Fire many concurrent homebound routes at a version with capacity 3; exactly
+    // three succeed, the rest report NO_CAPACITY. Proves atomic reservation.
+    let store = Arc::new(Store::open(":memory:").unwrap());
+    import_active(
+        store.clone(),
+        home_only_catalog("CONC-1", json!([{"slotId": "SLOT-AM", "cost": 5, "capacity": 3}])),
+    )
+    .await;
+
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let s = store.clone();
+        handles.push(tokio::spawn(async move {
+            let (_st, body) = call(s, "POST", "/route", homebound_legal_aid()).await;
+            body["result"]["home_service"]["status"].as_str().unwrap().to_string()
+        }));
+    }
+    let mut reserved = 0;
+    let mut no_cap = 0;
+    for h in handles {
+        match h.await.unwrap().as_str() {
+            "RESERVED" => reserved += 1,
+            "NO_CAPACITY" => no_cap += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(reserved, 3, "exactly capacity reservations succeed");
+    assert_eq!(no_cap, 17);
+}
+
 

@@ -131,7 +131,12 @@ async fn route_once(
         Some(c) => c,
         None => return err(StatusCode::CONFLICT, "no active catalog").into_response(),
     };
-    let result = routing::route(&catalog, &req);
+    let mut result = routing::route(&catalog, &req);
+    // Resolve home-service appointment capacity (reserve a slot or NoCapacity)
+    // before persisting, so the snapshot reflects the actual reservation.
+    if let Err(e) = store.resolve_home_capacity(&mut result) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     match store.save_snapshot(&req, &result) {
         Ok(snapshot_id) => Json(RouteResponse { snapshot_id, result }).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -171,7 +176,14 @@ async fn route_batch(
     };
     let mut items = Vec::with_capacity(body.requests.len());
     for req in &body.requests {
-        let result = routing::route(&catalog, req);
+        let mut result = routing::route(&catalog, req);
+        // Capacity is consumed per item, in request order, so a batch can
+        // legitimately exhaust slots partway through: earlier items reserve and
+        // later ones get HOME_SERVICE_NO_CAPACITY. Routing itself stays pinned
+        // to the single captured catalog version.
+        if let Err(e) = store.resolve_home_capacity(&mut result) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
         let snapshot_id = if body.persist {
             match store.save_snapshot(req, &result) {
                 Ok(id) => Some(id),

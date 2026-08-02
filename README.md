@@ -44,8 +44,11 @@ immutable once imported.
 - **Cost formula**:
   `abs(originX-pointX) + abs(originY-pointY) + barrierPenalty` (Manhattan grid
   distance plus the point's barrier penalty). No external routing.
-- **Home service**: a `HOMEBOUND` applicant requesting the allowed service
-  (`LEGAL_AID`) is flagged `HOME_SERVICE_REQUIRED` in the result.
+- **Home service (fallback)**: a *degraded path*, not a shortcut. It is offered
+  only when **all** of: the applicant's mobility is `HOMEBOUND`, the requested
+  service is `LEGAL_AID`, and **every physical point was excluded** (no reachable
+  candidate). The physical exclusion chain is always preserved alongside it.
+  See [Home-service fallback & appointment capacity](#home-service-fallback--appointment-capacity).
 
 ### Temporary events
 
@@ -76,6 +79,55 @@ intentionally overlapping pair on `POINT-C`:
 If several degradations remove the same needed capability, the lowest `eventId`
 is reported (deterministic).
 
+### Home-service fallback & appointment capacity
+
+`HOME_SERVICE_REQUIRED` is a **fallback**, returned only when every physical
+point is excluded (never as a shortcut past a reachable point). When eligible,
+the router books a home-visit **appointment slot** from a finite pool.
+
+- **Slots** are declared per catalog version: `{slotId, cost, capacity}`. They
+  are tried in `(cost ascending, slotId ascending)` order — the same tie-break
+  as physical candidates — so two equal-cost slots compete deterministically
+  (lower id wins).
+- **Capacity** is live per-`(version, slot)` state kept in `home_reservations`,
+  *outside* the immutable catalog. Consequences:
+  - Reserving is **atomic** (one SQLite transaction), so concurrent requests
+    never overbook and capacity can genuinely run out mid-batch.
+  - A **catalog version switch starts capacity fresh** (a different version has
+    its own reservation rows).
+  - Closure/degradation hot-updates rebuild the catalog `Arc` but never disturb
+    reservations.
+- **Outcomes** (`home_service.status`):
+  - `RESERVED` — a slot was booked; `slot_id` and `slot_cost` are included.
+  - `NO_CAPACITY` — eligible but every slot is full; `reason` becomes
+    `HOME_SERVICE_NO_CAPACITY`. The candidate list stays empty — **a capacity
+    shortage never falls back to an inaccessible or closed physical point.**
+  - (`ELIGIBLE` is the transient state from the pure router before the store
+    resolves capacity; it never appears in an HTTP response.)
+
+Example (all physical points excluded, first eligible request):
+
+```jsonc
+{
+  "candidates": [],
+  "exclusions": [
+    {"point_id": "POINT-A", "reasons": ["MISSING_ACCESS:SIGN_INTERPRETER"]},
+    {"point_id": "POINT-B", "reasons": ["MISSING_ACCESS:TEXT_COMMUNICATION"]},
+    {"point_id": "POINT-C", "reasons": ["CLOSED:CLOSE-01"]}
+  ],
+  "home_service": {
+    "reason": "HOME_SERVICE_REQUIRED",
+    "status": "RESERVED",
+    "slot_id": "SLOT-AM",
+    "slot_cost": 5
+  }
+}
+```
+
+The pure routing function never mutates `hardRequirements` and the round-1
+capability mapping is unchanged; the fallback only adds an outcome when the
+physical set is empty.
+
 ## Schema setup
 
 SQLite is the source of truth; the connection is opened (and the schema created)
@@ -89,6 +141,8 @@ automatically on startup — no migration step is required. Tables:
 | `point_access`      | Accessibility capabilities per point                          |
 | `hard_requirements` | Need-key → required capability, per version                   |
 | `home_service` / `home_mobility` | Home-service policy per version                  |
+| `home_slots`        | Appointment slot definitions `(slotId, cost, capacity)` per version |
+| `home_reservations` | Live per-`(version, slot)` reservation counts (capacity state) |
 | `closures`          | Temporary closures `[from, to)`, keyed by `(version, event_id)` |
 | `degradations`      | Temporary capability losses `[from, to)`, keyed by `(version, event_id)` |
 | `active_version`    | Single-row pointer to the currently active version           |
@@ -272,10 +326,10 @@ single captured version and satisfies the hard capability.
 
 ## Tests
 
-`cargo test` runs 18 integration tests. Round 1 covers: hard-filter-before-cost
+`cargo test` runs 23 integration tests. Round 1 covers: hard-filter-before-cost
 (closer point excluded), all-hard-capabilities-unsatisfied (empty candidates +
 full reason chain), equal-cost tie-break, input-order independence, home-service
-eligibility, half-open closure boundaries, HTTP closure start/end, batch
+fallback gating, half-open closure boundaries, HTTP closure start/end, batch
 routing, snapshot isolation under hot reload, concurrency, and a repeatable
 performance record.
 
@@ -295,6 +349,22 @@ Round 2 (capability degradation) adds:
 - `batch_pinned_to_single_version_during_degradation_reload` — 300 concurrent
   batches vs. a degradation-toggling reloader; every batch's items agree, so no
   batch mixes pre- and post-degradation data.
+
+Round 3 (home-service fallback + appointment capacity) adds:
+
+- `home_service_is_fallback_only` — home service triggers only when every
+  physical point is excluded; a reachable point yields no home outcome, and the
+  physical exclusion chain is preserved.
+- `home_capacity_exhausts_mid_batch` — a 3-request batch against 2 slots reserves
+  two then returns `NO_CAPACITY`, never listing the inaccessible point.
+- `two_equal_cost_slots_compete_deterministically` — equal-cost slots are booked
+  lowest-id-first, independent of declaration order.
+- `version_switch_resets_capacity` — exhausted capacity on one version; a fresh
+  version reserves again.
+- `no_capacity_never_falls_back_to_inaccessible_point` — zero capacity yields
+  `NO_CAPACITY` with empty candidates; the hard-excluded point is never offered.
+- `concurrent_reservations_never_overbook` — 20 concurrent requests vs. capacity
+  3: exactly 3 reserve, 17 get `NO_CAPACITY` (atomic reservation).
 
 ### Performance record
 
