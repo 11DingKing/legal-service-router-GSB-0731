@@ -8,6 +8,8 @@
 //! - `POST /route/batch`               batch routing over one captured version
 //! - `POST /closures/start`            begin a temporary closure
 //! - `POST /closures/end`              end a temporary closure
+//! - `POST /degradations/start`        begin a temporary capability degradation
+//! - `POST /degradations/end`          end a temporary capability degradation
 //! - `GET  /snapshots/:id`             replay a stored snapshot verbatim
 
 use std::sync::Arc;
@@ -36,6 +38,8 @@ pub fn router(state: AppState) -> Router {
         .route("/route/batch", post(route_batch))
         .route("/closures/start", post(start_closure))
         .route("/closures/end", post(end_closure))
+        .route("/degradations/start", post(start_degradation))
+        .route("/degradations/end", post(end_degradation))
         .route("/snapshots/:id", get(get_snapshot))
         .with_state(state)
 }
@@ -218,6 +222,44 @@ async fn end_closure(
     Json(body): Json<EndClosureQuery>,
 ) -> impl IntoResponse {
     match store.end_closure(&body.version, &body.event_id, body.at) {
+        Ok(ended_at) => Json(EndClosureResponse { ended_at }).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct StartDegradationQuery {
+    version: String,
+    event_id: String,
+    point_id: String,
+    /// Access capability temporarily removed while active.
+    capability: String,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+async fn start_degradation(
+    State(store): State<AppState>,
+    Json(body): Json<StartDegradationQuery>,
+) -> impl IntoResponse {
+    match store.start_degradation(
+        &body.version,
+        &body.event_id,
+        &body.point_id,
+        &body.capability,
+        body.from,
+        body.to,
+    ) {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn end_degradation(
+    State(store): State<AppState>,
+    Json(body): Json<EndClosureQuery>,
+) -> impl IntoResponse {
+    match store.end_degradation(&body.version, &body.event_id, body.at) {
         Ok(ended_at) => Json(EndClosureResponse { ended_at }).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
     }

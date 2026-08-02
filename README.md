@@ -47,6 +47,35 @@ immutable once imported.
 - **Home service**: a `HOMEBOUND` applicant requesting the allowed service
   (`LEGAL_AID`) is flagged `HOME_SERVICE_REQUIRED` in the result.
 
+### Temporary events
+
+Two independent kinds of temporary event affect a point over a half-open
+interval `[from, to)`:
+
+- **Closure** (`closures`) — the *whole point* is unavailable. Reason
+  `CLOSED:<eventId>`.
+- **Capability degradation** (`degradations`) — the point stays open but
+  *temporarily loses one access capability* (e.g. a broken lift removes
+  `STEP_FREE`). Reason `DEGRADED:<eventId>:<capability>`, emitted only when the
+  applicant actually needs that capability.
+
+**Overlap priority — closure dominates degradation.** While a point is closed,
+`CLOSED:<eventId>` is the sole temporal reason and any overlapping degradation is
+suppressed (an unavailable point's individual capabilities are moot). Only once
+the point re-opens do active degradations apply. The fixture ships an
+intentionally overlapping pair on `POINT-C`:
+
+| Instant (UTC)          | Active events            | POINT-C outcome (wheelchair → NOTARY) |
+| ---------------------- | ------------------------ | ------------------------------------- |
+| `< 08-02`              | none                     | candidate                             |
+| `[08-02, 08-03)`       | CLOSE-01                 | `CLOSED:CLOSE-01`                     |
+| `[08-03, 08-04)`       | CLOSE-01 **+** DEGRADE-01 | `CLOSED:CLOSE-01` (closure wins)     |
+| `[08-04, 08-05)`       | DEGRADE-01               | `DEGRADED:DEGRADE-01:STEP_FREE`      |
+| `>= 08-05`             | none                     | candidate                             |
+
+If several degradations remove the same needed capability, the lowest `eventId`
+is reported (deterministic).
+
 ## Schema setup
 
 SQLite is the source of truth; the connection is opened (and the schema created)
@@ -61,11 +90,15 @@ automatically on startup — no migration step is required. Tables:
 | `hard_requirements` | Need-key → required capability, per version                   |
 | `home_service` / `home_mobility` | Home-service policy per version                  |
 | `closures`          | Temporary closures `[from, to)`, keyed by `(version, event_id)` |
+| `degradations`      | Temporary capability losses `[from, to)`, keyed by `(version, event_id)` |
 | `active_version`    | Single-row pointer to the currently active version           |
 | `snapshots`         | Immutable routing results (request + result JSON)            |
 
-Closures live in their own table (not inside the raw blob) so the start/end
-endpoints can toggle a closure without rewriting the imported catalog.
+Closures and degradations live in their own tables (not inside the raw blob) so
+the start/end endpoints can toggle an event without rewriting the imported
+catalog. Every toggle rebuilds that version's normalized catalog and atomically
+swaps a fresh `Arc<Catalog>` into the cache (cache invalidation), while any
+snapshot taken earlier keeps replaying its own frozen data.
 
 ## Endpoints
 
@@ -132,8 +165,9 @@ excluded for missing `STEP_FREE`; POINT-A wins. `at` is optional and defaults to
 request time; supply it to evaluate closures deterministically.
 
 **Exclusion reason codes** (order-stable): `MISSING_SERVICE`,
-`MISSING_ACCESS:<CAPABILITY>` (one per missing capability, sorted),
-`CLOSED:<eventId>`.
+`MISSING_ACCESS:<CAPABILITY>` (structural, one per missing capability, sorted),
+`CLOSED:<eventId>` (whole point closed), `DEGRADED:<eventId>:<CAPABILITY>`
+(capability temporarily lost while the point is open).
 
 ### `POST /route/batch` — batch over one captured version
 
@@ -170,6 +204,26 @@ Closures use **half-open** intervals `[from, to)`: the point is closed *at*
 `from` and open again exactly *at* `to`. Ending clamps `to`, so a point re-opens
 at the effective end instant. Both operations rebuild that version's in-memory
 catalog and atomically swap it in.
+
+### `POST /degradations/start` / `POST /degradations/end`
+
+```bash
+# begin a temporary capability loss (POINT-A's STEP_FREE goes offline)
+curl -X POST localhost:8080/degradations/start -H 'content-type: application/json' -d '{
+  "version":"CAT-2026-07-31","event_id":"DEG-A","point_id":"POINT-A",
+  "capability":"STEP_FREE","from":"2026-09-01T00:00:00Z","to":"2026-09-10T00:00:00Z"
+}'  # 201
+
+# end it early (clamps `to` to `at`; defaults to now)
+curl -X POST localhost:8080/degradations/end -H 'content-type: application/json' -d '{
+  "version":"CAT-2026-07-31","event_id":"DEG-A","at":"2026-09-03T00:00:00Z"
+}'  # 200 {"ended_at":"2026-09-03T00:00:00Z"}
+```
+
+Same half-open semantics as closures. During the window the point remains a
+routing candidate for applicants who don't need the degraded capability, and is
+excluded with `DEGRADED:DEG-A:STEP_FREE` for those who do. See the overlap
+priority table above for closure-vs-degradation precedence.
 
 ### `GET /snapshots/:id` — replay verbatim
 
@@ -218,12 +272,29 @@ single captured version and satisfies the hard capability.
 
 ## Tests
 
-`cargo test` runs 11 integration tests covering: hard-filter-before-cost (closer
-point excluded), all-hard-capabilities-unsatisfied (empty candidates + full
-reason chain), equal-cost tie-break, input-order independence, home-service
+`cargo test` runs 18 integration tests. Round 1 covers: hard-filter-before-cost
+(closer point excluded), all-hard-capabilities-unsatisfied (empty candidates +
+full reason chain), equal-cost tie-break, input-order independence, home-service
 eligibility, half-open closure boundaries, HTTP closure start/end, batch
 routing, snapshot isolation under hot reload, concurrency, and a repeatable
 performance record.
+
+Round 2 (capability degradation) adds:
+
+- `degradation_timeline_and_overlap_priority` — the full `POINT-C` timeline and
+  closure-dominates-degradation precedence in the overlap window.
+- `degradation_half_open_boundaries` — behavior exactly at each `from`/`to`.
+- `degradation_ignored_when_capability_not_needed` — a degraded capability the
+  applicant doesn't need never excludes the point.
+- `equal_cost_candidates_with_degradation` — a degradation removes an equal-cost
+  candidate rather than reordering ties.
+- `http_start_and_end_degradation` — the start/end endpoints round-trip.
+- `snapshot_replay_pins_catalog_version_across_degradation_reload` — a snapshot
+  replays verbatim while a fresh route on the hot-updated catalog reflects the
+  new degradation (cache invalidation proof).
+- `batch_pinned_to_single_version_during_degradation_reload` — 300 concurrent
+  batches vs. a degradation-toggling reloader; every batch's items agree, so no
+  batch mixes pre- and post-degradation data.
 
 ### Performance record
 

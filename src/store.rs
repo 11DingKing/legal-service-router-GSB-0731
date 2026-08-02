@@ -28,7 +28,7 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
-use crate::model::{Catalog, Closure, RawCatalog};
+use crate::model::{Catalog, Closure, Degradation, RawCatalog};
 use crate::routing::{RouteRequest, RouteResult};
 
 /// Snapshot rows returned on replay.
@@ -179,6 +179,14 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             }
 
+            for d in &raw.degradations {
+                tx.execute(
+                    "INSERT INTO degradations(version, event_id, point_id, capability, from_ts, to_ts) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![version, d.event_id, d.point_id, d.capability, d.from.to_rfc3339(), d.to.to_rfc3339()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+
             if let Some(h) = &raw.home_service {
                 tx.execute(
                     "INSERT INTO home_service(version, allowed_service, reason) VALUES (?1,?2,?3)",
@@ -307,6 +315,81 @@ impl Store {
             let effective = if at < from { from } else { at };
             conn.execute(
                 "UPDATE closures SET to_ts = ?3 WHERE version = ?1 AND event_id = ?2",
+                params![version, event_id, effective.to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        self.rebuild_version(version)?;
+        Ok(at)
+    }
+
+    /// Start a temporary capability-degradation event on a point. Rebuilds and
+    /// swaps the version's `Arc` atomically. `event_id` must be unique.
+    pub fn start_degradation(
+        &self,
+        version: &str,
+        event_id: &str,
+        point_id: &str,
+        capability: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<(), String> {
+        if to < from {
+            return Err("degradation `to` precedes `from`".to_string());
+        }
+        {
+            let conn = self.conn.lock().unwrap();
+            let point_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM points WHERE version = ?1 AND id = ?2",
+                    params![version, point_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !point_exists {
+                return Err(format!("unknown point {point_id} in version {version}"));
+            }
+            conn.execute(
+                "INSERT INTO degradations(version, event_id, point_id, capability, from_ts, to_ts) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![version, event_id, point_id, capability, from.to_rfc3339(), to.to_rfc3339()],
+            )
+            .map_err(|e| {
+                if e.to_string().contains("UNIQUE") {
+                    format!("degradation event already exists: {event_id}")
+                } else {
+                    e.to_string()
+                }
+            })?;
+        }
+        self.rebuild_version(version)
+    }
+
+    /// End a temporary degradation at instant `at` (defaults to now) by clamping
+    /// its `to` bound. Returns the effective end instant.
+    pub fn end_degradation(
+        &self,
+        version: &str,
+        event_id: &str,
+        at: Option<DateTime<Utc>>,
+    ) -> Result<DateTime<Utc>, String> {
+        let at = at.unwrap_or_else(Utc::now);
+        {
+            let conn = self.conn.lock().unwrap();
+            let from_ts: Option<String> = conn
+                .query_row(
+                    "SELECT from_ts FROM degradations WHERE version = ?1 AND event_id = ?2",
+                    params![version, event_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let from_ts = from_ts
+                .ok_or_else(|| format!("unknown degradation event: {event_id}"))?;
+            let from = DateTime::parse_from_rfc3339(&from_ts)
+                .map_err(|e| e.to_string())?
+                .with_timezone(&Utc);
+            let effective = if at < from { from } else { at };
+            conn.execute(
+                "UPDATE degradations SET to_ts = ?3 WHERE version = ?1 AND event_id = ?2",
                 params![version, event_id, effective.to_rfc3339()],
             )
             .map_err(|e| e.to_string())?;
@@ -526,6 +609,39 @@ impl Store {
             }
         }
 
+        // Capability degradations.
+        let mut degradations_by_point: BTreeMap<String, Vec<Degradation>> = BTreeMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT event_id, point_id, capability, from_ts, to_ts FROM degradations WHERE version = ?1 ORDER BY event_id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![version], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (event_id, point_id, capability, from_ts, to_ts) =
+                    row.map_err(|e| e.to_string())?;
+                let from = DateTime::parse_from_rfc3339(&from_ts)
+                    .map_err(|e| e.to_string())?
+                    .with_timezone(&Utc);
+                let to = DateTime::parse_from_rfc3339(&to_ts)
+                    .map_err(|e| e.to_string())?
+                    .with_timezone(&Utc);
+                degradations_by_point
+                    .entry(point_id.clone())
+                    .or_default()
+                    .push(Degradation { event_id, point_id, capability, from, to });
+            }
+        }
+
         // Home service.
         let home_service = {
             let hs: Option<(String, String)> = conn
@@ -560,6 +676,7 @@ impl Store {
             hard_requirements,
             tie_break,
             closures_by_point,
+            degradations_by_point,
             home_service,
         })
     }
@@ -635,6 +752,16 @@ CREATE TABLE IF NOT EXISTS closures (
     point_id  TEXT NOT NULL,
     from_ts   TEXT NOT NULL,
     to_ts     TEXT NOT NULL,
+    PRIMARY KEY (version, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS degradations (
+    version    TEXT NOT NULL,
+    event_id   TEXT NOT NULL,
+    point_id   TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    from_ts    TEXT NOT NULL,
+    to_ts      TEXT NOT NULL,
     PRIMARY KEY (version, event_id)
 );
 

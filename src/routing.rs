@@ -144,19 +144,45 @@ pub fn route(catalog: &Catalog, req: &RouteRequest) -> RouteResult {
             reasons.push("MISSING_SERVICE".to_string());
         }
 
-        // Hard check 2: every mandatory access capability. Reasons are emitted
-        // in sorted capability order for stability.
+        // Hard check 2: every mandatory access capability that is *structurally*
+        // absent from the point. Reasons are emitted in sorted capability order.
         for cap in &needed_access {
             if !point.access.contains(cap) {
                 reasons.push(format!("MISSING_ACCESS:{cap}"));
             }
         }
 
-        // Hard check 3: temporary closure at the evaluation instant.
+        // Temporal checks. A CLOSURE dominates a capability DEGRADATION: while a
+        // point is closed the sole temporal reason is `CLOSED:<eventId>` and any
+        // overlapping degradation is suppressed (the whole point is unavailable,
+        // so its individual capabilities are moot). Only when the point is open
+        // do degradations remove otherwise-present capabilities.
+        let mut closed = false;
         if let Some(list) = catalog.closures_by_point.get(id) {
             for c in list {
                 if c.covers(evaluated_at) {
                     reasons.push(format!("CLOSED:{}", c.event_id));
+                    closed = true;
+                }
+            }
+        }
+
+        // Hard check 3: capability degradations, only when the point is open.
+        // For each needed capability that the point *has* structurally but that
+        // is degraded at the instant, report `DEGRADED:<eventId>:<cap>`. If
+        // several degradations remove the same capability the lowest event id
+        // wins (deterministic), since the list is sorted by event id.
+        if !closed {
+            if let Some(list) = catalog.degradations_by_point.get(id) {
+                for cap in &needed_access {
+                    if !point.access.contains(cap) {
+                        continue; // already reported as MISSING_ACCESS
+                    }
+                    if let Some(active) =
+                        list.iter().find(|d| &d.capability == cap && d.covers(evaluated_at))
+                    {
+                        reasons.push(format!("DEGRADED:{}:{}", active.event_id, cap));
+                    }
                 }
             }
         }

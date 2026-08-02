@@ -40,6 +40,9 @@ pub struct RawCatalog {
     pub tie_break: Vec<String>,
     #[serde(default)]
     pub closures: Vec<RawClosure>,
+    /// Temporary capability-degradation events that partially overlap closures.
+    #[serde(default)]
+    pub degradations: Vec<RawDegradation>,
     #[serde(rename = "homeService")]
     pub home_service: Option<RawHomeService>,
 }
@@ -62,6 +65,18 @@ pub struct RawClosure {
     pub event_id: String,
     #[serde(rename = "pointId")]
     pub point_id: String,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawDegradation {
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "pointId")]
+    pub point_id: String,
+    /// The single access capability temporarily removed while active.
+    pub capability: String,
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
 }
@@ -103,6 +118,25 @@ impl Closure {
     }
 }
 
+/// A temporary capability-degradation event. While active over half-open
+/// `[from, to)`, the point loses `capability` (e.g. its lift is broken, so
+/// `STEP_FREE` is temporarily unavailable) without the whole point closing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Degradation {
+    pub event_id: String,
+    pub point_id: String,
+    pub capability: String,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+impl Degradation {
+    /// True when the degradation is active at instant `at` (half-open).
+    pub fn covers(&self, at: DateTime<Utc>) -> bool {
+        at >= self.from && at < self.to
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HomeService {
     pub allowed_service: String,
@@ -123,6 +157,8 @@ pub struct Catalog {
     pub tie_break: Vec<String>,
     /// Closures keyed by point id for quick lookup.
     pub closures_by_point: BTreeMap<String, Vec<Closure>>,
+    /// Capability degradations keyed by point id.
+    pub degradations_by_point: BTreeMap<String, Vec<Degradation>>,
     pub home_service: Option<HomeService>,
 }
 
@@ -166,6 +202,26 @@ impl Catalog {
             list.sort_by(|a, b| a.event_id.cmp(&b.event_id));
         }
 
+        let mut degradations_by_point: BTreeMap<String, Vec<Degradation>> = BTreeMap::new();
+        for d in raw.degradations {
+            if d.to < d.from {
+                return Err(format!("degradation {} has to < from", d.event_id));
+            }
+            degradations_by_point
+                .entry(d.point_id.clone())
+                .or_default()
+                .push(Degradation {
+                    event_id: d.event_id,
+                    point_id: d.point_id,
+                    capability: d.capability,
+                    from: d.from,
+                    to: d.to,
+                });
+        }
+        for list in degradations_by_point.values_mut() {
+            list.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+        }
+
         let home_service = raw.home_service.map(|h| HomeService {
             allowed_service: h.allowed_service,
             allowed_mobility: h.allowed_mobility.into_iter().collect(),
@@ -179,6 +235,7 @@ impl Catalog {
             hard_requirements: raw.hard_requirements,
             tie_break: raw.tie_break,
             closures_by_point,
+            degradations_by_point,
             home_service,
         })
     }
