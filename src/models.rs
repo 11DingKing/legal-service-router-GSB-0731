@@ -13,6 +13,8 @@ pub struct Catalog {
     #[serde(rename = "tieBreak")]
     pub tie_break: Vec<String>,
     pub closures: Vec<Closure>,
+    #[serde(default)]
+    pub degradations: Vec<Degradation>,
     #[serde(rename = "homeService")]
     pub home_service: HomeService,
 }
@@ -72,6 +74,20 @@ pub struct Closure {
     pub point_id: String,
     pub from: chrono::DateTime<chrono::Utc>,
     pub to: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Degradation {
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "pointId")]
+    pub point_id: String,
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+    #[serde(rename = "unavailableAccess")]
+    pub unavailable_access: BTreeSet<String>,
+    #[serde(rename = "barrierPenaltyOverride", default)]
+    pub barrier_penalty_override: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
