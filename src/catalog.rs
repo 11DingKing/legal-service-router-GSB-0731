@@ -67,6 +67,18 @@ pub struct HomeServiceConfig {
     #[serde(rename = "allowedMobility")]
     pub allowed_mobility: Vec<String>,
     pub reason: String,
+    #[serde(default)]
+    pub slots: Vec<HomeServiceSlot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HomeServiceSlot {
+    #[serde(rename = "slotId")]
+    pub slot_id: String,
+    pub grid: [i32; 2],
+    pub capacity: i32,
+    #[serde(rename = "barrierPenalty", default)]
+    pub barrier_penalty: i32,
 }
 
 fn parse_time<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
@@ -149,6 +161,22 @@ fn validate_catalog(catalog: &Catalog) -> AppResult<()> {
             return Err(AppError::BadRequest(format!(
                 "degradation {} must remove at least one access capability",
                 d.event_id
+            )));
+        }
+    }
+
+    let mut slot_ids = std::collections::HashSet::new();
+    for s in &catalog.home_service.slots {
+        if s.capacity < 0 {
+            return Err(AppError::BadRequest(format!(
+                "home service slot {} has negative capacity",
+                s.slot_id
+            )));
+        }
+        if !slot_ids.insert(s.slot_id.clone()) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate home service slot id: {}",
+                s.slot_id
             )));
         }
     }

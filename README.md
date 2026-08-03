@@ -27,7 +27,7 @@ admin API.
 
 ```bash
 cargo run                 # starts on 0.0.0.0:8080, auto-imports the seed catalog
-cargo test                # runs 27 unit + 17 integration tests
+cargo test                # runs 30 unit + 23 integration tests
 ```
 
 Configuration (environment variables):
@@ -128,17 +128,78 @@ is fully unavailable, so the partial degradation is irrelevant). In the seed
 catalog `CLOSE-01` runs Aug 2–4 and `DEGRADE-01` runs Aug 3–5; they overlap on
 Aug 3, where closure wins.
 
-### Home service
+### Home service downgrade path
 
-When the requested service equals `homeService.allowedService` and the applicant's
-`mobility` includes one of the allowed mobility codes (e.g. `HOMEBOUND`), the
-response includes a `homeService` block:
+Home service is a **fallback**, not a parallel option. It is offered only when
+**all three** conditions hold:
+
+1. The requested service equals `homeService.allowedService` (`LEGAL_AID`).
+2. The applicant's `mobility` includes an allowed mobility code (`HOMEBOUND`).
+3. **Every physical service point is excluded** (by missing service, missing
+   hard capability, capability degradation, or temporary closure).
+
+When these hold, the response contains `candidates: []`, the full `excluded`
+array with every physical point's exclusion reasons **preserved**, and a
+`homeService` block:
 
 ```json
-{ "eligible": true, "reason": "HOME_SERVICE_REQUIRED" }
+{
+  "eligible": true,
+  "reason": "HOME_SERVICE_REQUIRED",
+  "slot": {
+    "slotId": "SLOT-MORNING",
+    "totalCost": 0,
+    "costBreakdown": { "distance": 0, "barrierPenalty": 0 },
+    "grid": [2, 2]
+  }
+}
 ```
 
-Physical candidates are still returned alongside it.
+If any physical candidate survives the hard filters, `homeService` is omitted
+entirely (the applicant can visit a point, so no home visit is needed).
+
+**No fallback to inaccessible points.** When home service capacity is
+exhausted, the response returns `candidates: []` and a `noCapacity` block — it
+never relaxes hard accessibility requirements to surface a non-compliant
+physical point:
+
+```json
+{
+  "eligible": true,
+  "reason": "HOME_SERVICE_REQUIRED",
+  "noCapacity": {
+    "code": "HOME_SERVICE_NO_CAPACITY",
+    "message": "all home service appointment slots are at capacity"
+  }
+}
+```
+
+### Appointment slots and capacity
+
+Home service slots are defined per catalog version under
+`homeService.slots`:
+
+```json
+{
+  "slotId": "SLOT-MORNING",
+  "grid": [2, 2],
+  "capacity": 2,
+  "barrierPenalty": 0
+}
+```
+
+- Slots are sorted by the same tie-break as physical candidates:
+  `(totalCost ascending, slotId ascending)`, where cost is Manhattan distance
+  from `originGrid` to the slot grid plus `barrierPenalty`.
+- Capacity is decremented **atomically** inside the snapshot transaction using
+  `UPDATE ... WHERE remaining_capacity > 0`. Concurrent requests compete
+  safely; exactly `capacity` requests reserve a slot, the rest receive
+  `HOME_SERVICE_NO_CAPACITY`.
+- If the best-cost slot is full, the next slot is tried in order.
+- Capacity is **isolated per catalog version**. Importing a new version resets
+  capacity independently; old V1 reservations do not affect V2 slots.
+- The reserved slot (or no-capacity status) is stored in the immutable snapshot
+  and returned on replay.
 
 ## HTTP API
 
@@ -221,6 +282,9 @@ version pinning and immutable replay possible.
   closures is allowed, with closure taking priority.
 - `hard_requirements` — need code -> required access code mapping.
 - `home_service_config` — allowed service, allowed mobility, reason.
+- `home_service_slots` — appointment slots per catalog version (`slot_id`,
+  grid, `total_capacity`, `remaining_capacity`, `barrier_penalty`); capacity is
+  atomically decremented on each home-service reservation.
 - `active_catalog` — single-row table (`id = 1`) holding the active version.
 - `routing_snapshots` — snapshot id, catalog version, original request JSON,
   query time, home-service result, creation time.
@@ -287,7 +351,13 @@ The suite covers, among other things:
 - capability-degradation start/end boundaries and `CAPABILITY_DEGRADED` reasons;
 - closure/degradation overlap priority (closure wins);
 - zero candidates when no point satisfies all hard requirements;
-- home-service eligibility;
+- home service downgrade only when all physical points are excluded;
+- home service slot tie-break by `(cost, slotId)`;
+- home service capacity exhaustion returning `HOME_SERVICE_NO_CAPACITY`;
+- concurrent capacity exhaustion (10 requests, 3 slots, exactly 3 reserved);
+- no fallback to inaccessible physical points when capacity is exhausted;
+- capacity isolated per catalog version;
+- snapshot replay preserving reserved slot and no-capacity state;
 - batch routing pinned to one version, including during a concurrent hot update;
 - input-order independence;
 - duplicate version conflict (`409`);

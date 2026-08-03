@@ -81,9 +81,32 @@ pub enum ExclusionReason {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HomeServiceSlotCandidate {
+    #[serde(rename = "slotId")]
+    pub slot_id: String,
+    #[serde(rename = "totalCost")]
+    pub total_cost: i32,
+    #[serde(rename = "costBreakdown")]
+    pub cost: CostBreakdown,
+    pub grid: [i32; 2],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoCapacityInfo {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HomeServiceResult {
     pub eligible: bool,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<HomeServiceSlotCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "noCapacity")]
+    pub no_capacity: Option<NoCapacityInfo>,
+    #[serde(skip)]
+    pub slot_candidates: Vec<HomeServiceSlotCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,7 +148,7 @@ pub fn resolve_query_time(req: &RouteRequest) -> AppResult<DateTime<Utc>> {
 pub fn compute(catalog: &Catalog, req: &RouteRequest, query_time: DateTime<Utc>) -> RouteResult {
     let required_access = resolve_required_access(catalog, req);
 
-    let home_service = resolve_home_service(catalog, req);
+    let is_home_service_eligible = is_home_service_eligible(catalog, req);
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut excluded: Vec<Excluded> = Vec::new();
@@ -238,6 +261,12 @@ pub fn compute(catalog: &Catalog, req: &RouteRequest, query_time: DateTime<Utc>)
         e.reasons.sort_by(compare_reasons);
     }
 
+    let home_service = if is_home_service_eligible && candidates.is_empty() {
+        build_home_service_result(catalog, req)
+    } else {
+        None
+    };
+
     RouteResult {
         home_service,
         candidates,
@@ -275,9 +304,9 @@ fn resolve_required_access(catalog: &Catalog, req: &RouteRequest) -> Vec<String>
     set.into_iter().collect()
 }
 
-fn resolve_home_service(catalog: &Catalog, req: &RouteRequest) -> Option<HomeServiceResult> {
+fn is_home_service_eligible(catalog: &Catalog, req: &RouteRequest) -> bool {
     if req.service != catalog.home_service.allowed_service {
-        return None;
+        return false;
     }
     let allowed: BTreeSet<&str> = catalog
         .home_service
@@ -285,15 +314,43 @@ fn resolve_home_service(catalog: &Catalog, req: &RouteRequest) -> Option<HomeSer
         .iter()
         .map(|s| s.as_str())
         .collect();
-    let eligible = req.mobility.iter().any(|m| allowed.contains(m.as_str()));
-    if eligible {
-        Some(HomeServiceResult {
-            eligible: true,
-            reason: catalog.home_service.reason.clone(),
+    req.mobility.iter().any(|m| allowed.contains(m.as_str()))
+}
+
+fn build_home_service_result(catalog: &Catalog, req: &RouteRequest) -> Option<HomeServiceResult> {
+    let mut slot_candidates: Vec<HomeServiceSlotCandidate> = catalog
+        .home_service
+        .slots
+        .iter()
+        .map(|slot| {
+            let distance = (req.origin_grid[0] - slot.grid[0]).abs()
+                + (req.origin_grid[1] - slot.grid[1]).abs();
+            let total_cost = distance + slot.barrier_penalty;
+            HomeServiceSlotCandidate {
+                slot_id: slot.slot_id.clone(),
+                total_cost,
+                cost: CostBreakdown {
+                    distance,
+                    barrier_penalty: slot.barrier_penalty,
+                },
+                grid: slot.grid,
+            }
         })
-    } else {
-        None
-    }
+        .collect();
+
+    slot_candidates.sort_by(|a, b| {
+        a.total_cost
+            .cmp(&b.total_cost)
+            .then_with(|| a.slot_id.cmp(&b.slot_id))
+    });
+
+    Some(HomeServiceResult {
+        eligible: true,
+        reason: catalog.home_service.reason.clone(),
+        slot: None,
+        no_capacity: None,
+        slot_candidates,
+    })
 }
 
 pub fn validate_request(req: &RouteRequest) -> AppResult<()> {
@@ -311,7 +368,7 @@ pub fn validate_request(req: &RouteRequest) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{Closure, Degradation, HomeServiceConfig, Point};
+    use crate::catalog::{Closure, Degradation, HomeServiceConfig, HomeServiceSlot, Point};
     use chrono::{Duration, TimeZone, Utc};
     use std::collections::HashMap;
 
@@ -389,6 +446,20 @@ mod tests {
                 allowed_service: "LEGAL_AID".into(),
                 allowed_mobility: vec!["HOMEBOUND".into()],
                 reason: "HOME_SERVICE_REQUIRED".into(),
+                slots: vec![
+                    HomeServiceSlot {
+                        slot_id: "SLOT-MORNING".into(),
+                        grid: [2, 2],
+                        capacity: 2,
+                        barrier_penalty: 0,
+                    },
+                    HomeServiceSlot {
+                        slot_id: "SLOT-AFTERNOON".into(),
+                        grid: [3, 1],
+                        capacity: 1,
+                        barrier_penalty: 0,
+                    },
+                ],
             },
         }
     }
@@ -536,20 +607,46 @@ mod tests {
     }
 
     #[test]
-    fn test_home_service_eligible() {
+    fn test_home_service_downgrade_when_all_physical_excluded() {
         let cat = sample_catalog();
         let (from, _) = closure_window();
-        let r = compute(&cat, &req("LEGAL_AID", &["HOMEBOUND"], &[], from), from);
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &["HOMEBOUND", "WHEELCHAIR"], &["HEARING"], from),
+            from,
+        );
+        assert!(r.candidates.is_empty(), "no physical candidates expected");
         let hs = r.home_service.as_ref().expect("home service expected");
         assert!(hs.eligible);
         assert_eq!(hs.reason, "HOME_SERVICE_REQUIRED");
+        assert_eq!(hs.slot_candidates.len(), 2);
+        assert_eq!(hs.slot_candidates[0].slot_id, "SLOT-MORNING");
+        assert_eq!(hs.slot_candidates[0].total_cost, 0);
+        assert_eq!(hs.slot_candidates[1].slot_id, "SLOT-AFTERNOON");
+        assert_eq!(hs.slot_candidates[1].total_cost, 2);
+
+        let excluded_ids: Vec<_> = r.excluded.iter().map(|e| e.point_id.clone()).collect();
+        assert_eq!(excluded_ids, vec!["POINT-A", "POINT-B", "POINT-C"]);
+        let a = r.excluded.iter().find(|e| e.point_id == "POINT-A").unwrap();
+        assert!(a.reasons.iter().any(|r| matches!(r, ExclusionReason::MissingAccess { required } if required == "SIGN_INTERPRETER")));
+        let c = r.excluded.iter().find(|e| e.point_id == "POINT-C").unwrap();
+        assert!(c.reasons.iter().any(|r| matches!(r, ExclusionReason::TemporarilyClosed { .. })));
+    }
+
+    #[test]
+    fn test_home_service_not_returned_when_physical_candidates_exist() {
+        let cat = sample_catalog();
+        let (from, _) = closure_window();
+        let r = compute(&cat, &req("LEGAL_AID", &["HOMEBOUND"], &[], from), from);
+        assert!(!r.candidates.is_empty(), "physical candidates expected");
+        assert!(r.home_service.is_none(), "home service should not be returned when physical options exist");
     }
 
     #[test]
     fn test_home_service_not_eligible_for_other_service() {
         let cat = sample_catalog();
         let (from, _) = closure_window();
-        let r = compute(&cat, &req("NOTARY", &["HOMEBOUND"], &[], from), from);
+        let r = compute(&cat, &req("NOTARY", &["HOMEBOUND", "WHEELCHAIR"], &["HEARING"], from), from);
         assert!(r.home_service.is_none());
     }
 
@@ -557,8 +654,53 @@ mod tests {
     fn test_home_service_not_eligible_without_homebound() {
         let cat = sample_catalog();
         let (from, _) = closure_window();
-        let r = compute(&cat, &req("LEGAL_AID", &[], &[], from), from);
+        let r = compute(&cat, &req("LEGAL_AID", &["WHEELCHAIR"], &["HEARING"], from), from);
         assert!(r.home_service.is_none());
+    }
+
+    #[test]
+    fn test_home_service_equal_cost_slots_tie_break_by_id() {
+        let mut cat = sample_catalog();
+        cat.home_service.slots = vec![
+            HomeServiceSlot {
+                slot_id: "SLOT-Z".into(),
+                grid: [2, 2],
+                capacity: 1,
+                barrier_penalty: 0,
+            },
+            HomeServiceSlot {
+                slot_id: "SLOT-A".into(),
+                grid: [2, 2],
+                capacity: 1,
+                barrier_penalty: 0,
+            },
+        ];
+        let (from, _) = closure_window();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &["HOMEBOUND", "WHEELCHAIR"], &["HEARING"], from),
+            from,
+        );
+        let hs = r.home_service.as_ref().unwrap();
+        assert_eq!(hs.slot_candidates.len(), 2);
+        assert_eq!(hs.slot_candidates[0].slot_id, "SLOT-A");
+        assert_eq!(hs.slot_candidates[1].slot_id, "SLOT-Z");
+        assert_eq!(hs.slot_candidates[0].total_cost, hs.slot_candidates[1].total_cost);
+    }
+
+    #[test]
+    fn test_home_service_no_slots_configured() {
+        let mut cat = sample_catalog();
+        cat.home_service.slots = vec![];
+        let (from, _) = closure_window();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &["HOMEBOUND", "WHEELCHAIR"], &["HEARING"], from),
+            from,
+        );
+        let hs = r.home_service.as_ref().unwrap();
+        assert!(hs.slot_candidates.is_empty());
+        assert!(r.candidates.is_empty());
     }
 
     #[test]

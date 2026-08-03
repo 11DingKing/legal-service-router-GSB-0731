@@ -160,9 +160,9 @@ async fn route_handler(
         let version = get_active_version(&state_clone.pool)?
             .ok_or_else(|| AppError::BadRequest("no active catalog imported".to_string()))?;
         let catalog = load_catalog_cached(&state_clone, &version)?;
-        let result = compute(&catalog, &req_clone, query_time);
+        let mut result = compute(&catalog, &req_clone, query_time);
         let snapshot_id =
-            save_snapshot(&state_clone.pool, &req_clone, &version, &query_time, &result)?;
+            save_snapshot(&state_clone.pool, &req_clone, &version, &query_time, &mut result)?;
         Ok(build_response(
             snapshot_id,
             version,
@@ -219,9 +219,9 @@ async fn route_batch_handler(
         let mut results = Vec::with_capacity(requests.len());
         for req in &requests {
             let query_time = resolve_query_time(req)?;
-            let result = compute(&catalog, req, query_time);
+            let mut result = compute(&catalog, req, query_time);
             let snapshot_id =
-                save_snapshot(&state_clone.pool, req, &version, &query_time, &result)?;
+                save_snapshot(&state_clone.pool, req, &version, &query_time, &mut result)?;
             let resp = build_response(
                 snapshot_id.clone(),
                 version.clone(),

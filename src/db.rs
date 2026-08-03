@@ -7,9 +7,12 @@ use rusqlite::params;
 use rusqlite::TransactionBehavior;
 use uuid::Uuid;
 
-use crate::catalog::{Catalog, Closure, Degradation, HomeServiceConfig, Point};
+use crate::catalog::{Catalog, Closure, Degradation, HomeServiceConfig, HomeServiceSlot, Point};
 use crate::error::{AppError, AppResult};
-use crate::routing::{Candidate, Excluded, RouteRequest, RouteResult};
+use crate::routing::{
+    Candidate, Excluded, HomeServiceResult, HomeServiceSlotCandidate, NoCapacityInfo,
+    RouteRequest, RouteResult,
+};
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
@@ -113,6 +116,18 @@ pub fn init_schema(pool: &DbPool) -> AppResult<()> {
             FOREIGN KEY (catalog_version) REFERENCES catalog_versions(version)
         );
 
+        CREATE TABLE IF NOT EXISTS home_service_slots (
+            catalog_version TEXT NOT NULL,
+            slot_id TEXT NOT NULL,
+            grid_x INTEGER NOT NULL,
+            grid_y INTEGER NOT NULL,
+            total_capacity INTEGER NOT NULL,
+            remaining_capacity INTEGER NOT NULL,
+            barrier_penalty INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (catalog_version, slot_id),
+            FOREIGN KEY (catalog_version) REFERENCES catalog_versions(version)
+        );
+
         CREATE TABLE IF NOT EXISTS active_catalog (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             version TEXT NOT NULL,
@@ -126,6 +141,13 @@ pub fn init_schema(pool: &DbPool) -> AppResult<()> {
             query_time TEXT NOT NULL,
             home_service_eligible INTEGER NOT NULL DEFAULT 0,
             home_service_reason TEXT,
+            home_slot_id TEXT,
+            home_slot_total_cost INTEGER,
+            home_slot_distance INTEGER,
+            home_slot_barrier_penalty INTEGER,
+            home_slot_grid_x INTEGER,
+            home_slot_grid_y INTEGER,
+            home_no_capacity INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
 
@@ -273,6 +295,23 @@ pub fn import_catalog(pool: &DbPool, catalog: &Catalog) -> AppResult<()> {
             catalog.home_service.reason,
         ],
     )?;
+
+    for slot in &catalog.home_service.slots {
+        tx.execute(
+            "INSERT INTO home_service_slots
+                (catalog_version, slot_id, grid_x, grid_y, total_capacity,
+                 remaining_capacity, barrier_penalty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            params![
+                catalog.catalog_version,
+                slot.slot_id,
+                slot.grid[0],
+                slot.grid[1],
+                slot.capacity,
+                slot.barrier_penalty,
+            ],
+        )?;
+    }
 
     tx.execute(
         "INSERT INTO active_catalog (id, version, activated_at)
@@ -470,6 +509,23 @@ pub fn load_catalog(pool: &DbPool, version: &str) -> AppResult<Catalog> {
 
     let allowed_mobility: Vec<String> = serde_json::from_str(&allowed_mobility_str)?;
 
+    let mut slot_stmt = conn.prepare(
+        "SELECT slot_id, grid_x, grid_y, total_capacity, barrier_penalty
+         FROM home_service_slots
+         WHERE catalog_version = ?1
+         ORDER BY slot_id ASC",
+    )?;
+    let slots: Vec<HomeServiceSlot> = slot_stmt
+        .query_map(params![version], |row| {
+            Ok(HomeServiceSlot {
+                slot_id: row.get(0)?,
+                grid: [row.get(1)?, row.get(2)?],
+                capacity: row.get(3)?,
+                barrier_penalty: row.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
     Ok(Catalog {
         catalog_version: version.to_string(),
         cost_formula,
@@ -482,6 +538,7 @@ pub fn load_catalog(pool: &DbPool, version: &str) -> AppResult<Catalog> {
             allowed_service,
             allowed_mobility,
             reason,
+            slots,
         },
     })
 }
@@ -491,7 +548,7 @@ pub fn save_snapshot(
     request: &RouteRequest,
     catalog_version: &str,
     query_time: &DateTime<Utc>,
-    result: &RouteResult,
+    result: &mut RouteResult,
 ) -> AppResult<String> {
     let mut conn = pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -499,18 +556,73 @@ pub fn save_snapshot(
     let snapshot_id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
 
+    let mut reserved_slot: Option<HomeServiceSlotCandidate> = None;
+    let mut no_capacity = false;
+
+    if let Some(hs) = &result.home_service {
+        if hs.eligible {
+            for slot_cand in &hs.slot_candidates {
+                let updated = tx.execute(
+                    "UPDATE home_service_slots
+                     SET remaining_capacity = remaining_capacity - 1
+                     WHERE catalog_version = ?1 AND slot_id = ?2
+                       AND remaining_capacity > 0",
+                    params![catalog_version, slot_cand.slot_id],
+                )?;
+                if updated == 1 {
+                    reserved_slot = Some(slot_cand.clone());
+                    break;
+                }
+            }
+            if reserved_slot.is_none() {
+                no_capacity = true;
+            }
+        }
+    }
+
+    if let Some(hs) = &mut result.home_service {
+        if let Some(slot) = &reserved_slot {
+            hs.slot = Some(slot.clone());
+            hs.no_capacity = None;
+        } else if no_capacity {
+            hs.slot = None;
+            hs.no_capacity = Some(NoCapacityInfo {
+                code: "HOME_SERVICE_NO_CAPACITY".to_string(),
+                message: "all home service appointment slots are at capacity".to_string(),
+            });
+        }
+        hs.slot_candidates = Vec::new();
+    }
+
+    let hs_slot_id = reserved_slot.as_ref().map(|s| s.slot_id.clone());
+    let hs_total_cost = reserved_slot.as_ref().map(|s| s.total_cost);
+    let hs_distance = reserved_slot.as_ref().map(|s| s.cost.distance);
+    let hs_barrier = reserved_slot.as_ref().map(|s| s.cost.barrier_penalty);
+    let hs_grid_x = reserved_slot.as_ref().map(|s| s.grid[0]);
+    let hs_grid_y = reserved_slot.as_ref().map(|s| s.grid[1]);
+
     tx.execute(
         "INSERT INTO routing_snapshots
             (snapshot_id, catalog_version, request_json, query_time,
-             home_service_eligible, home_service_reason, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             home_service_eligible, home_service_reason,
+             home_slot_id, home_slot_total_cost, home_slot_distance,
+             home_slot_barrier_penalty, home_slot_grid_x, home_slot_grid_y,
+             home_no_capacity, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             snapshot_id,
             catalog_version,
             serde_json::to_string(request)?,
             query_time.to_rfc3339(),
-            result.home_service.as_ref().map_or(0, |_| 1),
+            result.home_service.is_some() as i32,
             result.home_service.as_ref().map(|h| h.reason.clone()),
+            hs_slot_id,
+            hs_total_cost,
+            hs_distance,
+            hs_barrier,
+            hs_grid_x,
+            hs_grid_y,
+            no_capacity as i32,
             created_at,
         ],
     )?;
@@ -563,7 +675,10 @@ pub fn load_snapshot(
     let row = conn
         .prepare(
             "SELECT request_json, catalog_version, query_time,
-                    home_service_eligible, home_service_reason
+                    home_service_eligible, home_service_reason,
+                    home_slot_id, home_slot_total_cost, home_slot_distance,
+                    home_slot_barrier_penalty, home_slot_grid_x, home_slot_grid_y,
+                    home_no_capacity
              FROM routing_snapshots WHERE snapshot_id = ?1",
         )?
         .query_row(params![snapshot_id], |row| {
@@ -572,7 +687,17 @@ pub fn load_snapshot(
             let qt_s: String = row.get(2)?;
             let hse: i32 = row.get(3)?;
             let hsr: Option<String> = row.get(4)?;
-            Ok((req_s, cv, qt_s, hse, hsr))
+            let slot_id: Option<String> = row.get(5)?;
+            let slot_tc: Option<i32> = row.get(6)?;
+            let slot_dist: Option<i32> = row.get(7)?;
+            let slot_bp: Option<i32> = row.get(8)?;
+            let slot_gx: Option<i32> = row.get(9)?;
+            let slot_gy: Option<i32> = row.get(10)?;
+            let no_cap: i32 = row.get(11)?;
+            Ok((
+                req_s, cv, qt_s, hse, hsr, slot_id, slot_tc, slot_dist, slot_bp,
+                slot_gx, slot_gy, no_cap,
+            ))
         })
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
@@ -581,7 +706,20 @@ pub fn load_snapshot(
             other => AppError::Db(other),
         })?;
 
-    let (req_s, catalog_version, qt_s, hse, hsr) = row;
+    let (
+        req_s,
+        catalog_version,
+        qt_s,
+        hse,
+        hsr,
+        slot_id,
+        slot_tc,
+        slot_dist,
+        slot_bp,
+        slot_gx,
+        slot_gy,
+        no_cap,
+    ) = row;
     let request: RouteRequest = serde_json::from_str(&req_s)?;
     let query_time = DateTime::parse_from_rfc3339(&qt_s)?.with_timezone(&Utc);
 
@@ -628,9 +766,35 @@ pub fn load_snapshot(
         .collect::<Result<_, _>>()?;
 
     let home_service = if hse != 0 {
-        Some(crate::routing::HomeServiceResult {
+        let slot = if let (Some(id), Some(tc), Some(dist), Some(bp), Some(gx), Some(gy)) =
+            (slot_id, slot_tc, slot_dist, slot_bp, slot_gx, slot_gy)
+        {
+            Some(HomeServiceSlotCandidate {
+                slot_id: id,
+                total_cost: tc,
+                cost: crate::routing::CostBreakdown {
+                    distance: dist,
+                    barrier_penalty: bp,
+                },
+                grid: [gx, gy],
+            })
+        } else {
+            None
+        };
+        let no_capacity = if no_cap != 0 {
+            Some(NoCapacityInfo {
+                code: "HOME_SERVICE_NO_CAPACITY".to_string(),
+                message: "all home service appointment slots are at capacity".to_string(),
+            })
+        } else {
+            None
+        };
+        Some(HomeServiceResult {
             eligible: true,
             reason: hsr.unwrap_or_else(|| "HOME_SERVICE_REQUIRED".to_string()),
+            slot,
+            no_capacity,
+            slot_candidates: Vec::new(),
         })
     } else {
         None

@@ -27,7 +27,15 @@ fn v1_catalog() -> Value {
         "tieBreak": ["totalCost ascending", "point id ascending"],
         "closures": [{"eventId": "CLOSE-01", "pointId": "POINT-C", "from": "2026-08-02T00:00:00Z", "to": "2026-08-04T00:00:00Z"}],
         "degradations": [{"eventId": "DEGRADE-01", "pointId": "POINT-C", "from": "2026-08-03T00:00:00Z", "to": "2026-08-05T00:00:00Z", "removedAccess": ["SIGN_INTERPRETER"]}],
-        "homeService": {"allowedService": "LEGAL_AID", "allowedMobility": ["HOMEBOUND"], "reason": "HOME_SERVICE_REQUIRED"}
+        "homeService": {
+            "allowedService": "LEGAL_AID",
+            "allowedMobility": ["HOMEBOUND"],
+            "reason": "HOME_SERVICE_REQUIRED",
+            "slots": [
+                {"slotId": "SLOT-MORNING", "grid": [2, 2], "capacity": 2, "barrierPenalty": 0},
+                {"slotId": "SLOT-AFTERNOON", "grid": [3, 1], "capacity": 1, "barrierPenalty": 0}
+            ]
+        }
     })
 }
 
@@ -46,6 +54,14 @@ fn v2_catalog() -> Value {
         }));
     cat["closures"] = json!([]);
     cat["degradations"] = json!([]);
+    cat["homeService"] = json!({
+        "allowedService": "LEGAL_AID",
+        "allowedMobility": ["HOMEBOUND"],
+        "reason": "HOME_SERVICE_REQUIRED",
+        "slots": [
+            {"slotId": "SLOT-V2-MORNING", "grid": [2, 2], "capacity": 5, "barrierPenalty": 0}
+        ]
+    });
     cat
 }
 
@@ -463,13 +479,18 @@ async fn test_home_service_flag() {
         &json!({
             "originGrid": [2, 2],
             "service": "LEGAL_AID",
-            "mobility": ["HOMEBOUND"],
-            "queryTime": "2026-08-05T00:00:00Z"
+            "mobility": ["HOMEBOUND", "WHEELCHAIR"],
+            "communication": ["HEARING"],
+            "queryTime": "2026-08-02T12:00:00Z"
         }),
     )
     .await;
+    assert_eq!(r["candidates"].as_array().unwrap().len(), 0);
     assert_eq!(r["homeService"]["eligible"], true);
     assert_eq!(r["homeService"]["reason"], "HOME_SERVICE_REQUIRED");
+    assert_eq!(r["homeService"]["slot"]["slotId"], "SLOT-MORNING");
+    assert_eq!(r["homeService"]["slot"]["totalCost"], 0);
+    assert!(r["excluded"].as_array().unwrap().len() >= 3);
 }
 
 #[tokio::test]
@@ -778,4 +799,229 @@ async fn test_cache_serves_new_version_after_hot_reload() {
         .await
         .unwrap();
     assert_eq!(active["catalogVersion"], "CAT-V2");
+}
+
+fn homebound_all_excluded_body() -> Value {
+    json!({
+        "originGrid": [2, 2],
+        "service": "LEGAL_AID",
+        "mobility": ["HOMEBOUND", "WHEELCHAIR"],
+        "communication": ["HEARING"],
+        "queryTime": "2026-08-02T12:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn test_home_service_capacity_exhausted_returns_no_capacity() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let r1 = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(r1["homeService"]["slot"]["slotId"], "SLOT-MORNING");
+    assert!(r1["homeService"]["noCapacity"].is_null());
+
+    let r2 = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(r2["homeService"]["slot"]["slotId"], "SLOT-MORNING");
+
+    let r3 = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(r3["homeService"]["slot"]["slotId"], "SLOT-AFTERNOON");
+
+    let r4 = route(&base, &homebound_all_excluded_body()).await;
+    assert!(r4["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(r4["homeService"]["eligible"], true);
+    assert_eq!(
+        r4["homeService"]["noCapacity"]["code"],
+        "HOME_SERVICE_NO_CAPACITY"
+    );
+    assert!(r4["homeService"]["slot"].is_null());
+    assert!(r4["excluded"].as_array().unwrap().len() >= 3);
+}
+
+#[tokio::test]
+async fn test_no_fallback_to_inaccessible_physical_when_capacity_exhausted() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    for _ in 0..4 {
+        let _ = route(&base, &homebound_all_excluded_body()).await;
+    }
+
+    let r = route(&base, &homebound_all_excluded_body()).await;
+    assert!(r["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(
+        r["homeService"]["noCapacity"]["code"],
+        "HOME_SERVICE_NO_CAPACITY"
+    );
+    let excluded_ids: Vec<&str> = r["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["pointId"].as_str().unwrap())
+        .collect();
+    assert!(excluded_ids.contains(&"POINT-A"));
+    assert!(excluded_ids.contains(&"POINT-B"));
+    assert!(excluded_ids.contains(&"POINT-C"));
+    let b = r["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["pointId"] == "POINT-B")
+        .unwrap();
+    assert!(b["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["code"] == "MISSING_ACCESS"));
+}
+
+#[tokio::test]
+async fn test_concurrent_capacity_exhaustion() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let client = reqwest::Client::new();
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let c = client.clone();
+        let b = base.clone();
+        let body = homebound_all_excluded_body();
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/route"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }));
+    }
+
+    let mut reserved = 0;
+    let mut no_capacity = 0;
+    for h in handles {
+        let r = h.await.unwrap();
+        if r["homeService"]["slot"].is_object() {
+            reserved += 1;
+        } else if r["homeService"]["noCapacity"].is_object() {
+            no_capacity += 1;
+        }
+        assert!(r["candidates"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(reserved, 3, "exactly 3 slots available (2+1)");
+    assert_eq!(no_capacity, 7, "remaining requests get no-capacity");
+}
+
+#[tokio::test]
+async fn test_equal_cost_home_slots_stable_tie_break() {
+    let (base, _dir) = spawn_app().await;
+    let mut cat = v1_catalog();
+    cat["homeService"] = json!({
+        "allowedService": "LEGAL_AID",
+        "allowedMobility": ["HOMEBOUND"],
+        "reason": "HOME_SERVICE_REQUIRED",
+        "slots": [
+            {"slotId": "SLOT-Z", "grid": [2, 2], "capacity": 1, "barrierPenalty": 0},
+            {"slotId": "SLOT-A", "grid": [2, 2], "capacity": 1, "barrierPenalty": 0}
+        ]
+    });
+    import(&base, &cat).await;
+
+    let r = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(r["homeService"]["slot"]["slotId"], "SLOT-A");
+    assert_eq!(r["homeService"]["slot"]["totalCost"], 0);
+
+    let r2 = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(r2["homeService"]["slot"]["slotId"], "SLOT-Z");
+
+    let r3 = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(
+        r3["homeService"]["noCapacity"]["code"],
+        "HOME_SERVICE_NO_CAPACITY"
+    );
+}
+
+#[tokio::test]
+async fn test_capacity_isolated_per_catalog_version() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    for _ in 0..3 {
+        let _ = route(&base, &homebound_all_excluded_body()).await;
+    }
+    let r_v1_full = route(&base, &homebound_all_excluded_body()).await;
+    assert_eq!(
+        r_v1_full["homeService"]["noCapacity"]["code"],
+        "HOME_SERVICE_NO_CAPACITY"
+    );
+
+    let mut v2 = v1_catalog();
+    v2["catalogVersion"] = json!("CAT-V2");
+    v2["points"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "POINT-D",
+            "grid": [2, 2],
+            "services": ["MEDIATION"],
+            "access": ["STEP_FREE", "SIGN_INTERPRETER", "TEXT_COMMUNICATION"],
+            "barrierPenalty": 0
+        }));
+    v2["closures"] = json!([
+        {"eventId": "CLOSE-V2", "pointId": "POINT-C", "from": "2026-08-01T00:00:00Z", "to": "2026-12-31T00:00:00Z"}
+    ]);
+    v2["degradations"] = json!([]);
+    v2["homeService"] = json!({
+        "allowedService": "LEGAL_AID",
+        "allowedMobility": ["HOMEBOUND"],
+        "reason": "HOME_SERVICE_REQUIRED",
+        "slots": [
+            {"slotId": "SLOT-V2-MORNING", "grid": [2, 2], "capacity": 5, "barrierPenalty": 0}
+        ]
+    });
+    import(&base, &v2).await;
+
+    let r_v2 = route(
+        &base,
+        &json!({
+            "originGrid": [2, 2],
+            "service": "LEGAL_AID",
+            "mobility": ["HOMEBOUND", "WHEELCHAIR"],
+            "communication": ["HEARING"],
+            "queryTime": "2026-08-06T00:00:00Z"
+        }),
+    )
+    .await;
+    assert_eq!(r_v2["catalogVersion"], "CAT-V2");
+    assert_eq!(r_v2["candidates"].as_array().unwrap().len(), 0);
+    assert_eq!(r_v2["homeService"]["slot"]["slotId"], "SLOT-V2-MORNING");
+    assert!(r_v2["homeService"]["noCapacity"].is_null());
+}
+
+#[tokio::test]
+async fn test_snapshot_replay_preserves_home_slot() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let r = route(&base, &homebound_all_excluded_body()).await;
+    let snap_id = r["snapshotId"].as_str().unwrap().to_string();
+    assert_eq!(r["homeService"]["slot"]["slotId"], "SLOT-MORNING");
+
+    for _ in 0..4 {
+        let _ = route(&base, &homebound_all_excluded_body()).await;
+    }
+
+    let replayed: Value = reqwest::Client::new()
+        .get(format!("{base}/snapshots/{snap_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed["catalogVersion"], "CAT-V1");
+    assert_eq!(replayed["homeService"]["slot"]["slotId"], "SLOT-MORNING");
+    assert_eq!(replayed["homeService"]["slot"]["totalCost"], 0);
+    assert!(replayed["homeService"]["noCapacity"].is_null());
+    assert!(replayed["candidates"].as_array().unwrap().is_empty());
 }
