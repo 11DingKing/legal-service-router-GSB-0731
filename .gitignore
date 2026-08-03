@@ -5,3 +5,8 @@ target/
 .env
 .idea/
 
+
+
+# Added by cargo
+
+/target
