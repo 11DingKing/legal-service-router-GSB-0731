@@ -1,3 +1,4 @@
+use crate::capacity::CapacityManager;
 use crate::db::Db;
 use crate::models::{
     BatchRouteRequest, BatchRouteResponse, Catalog, RouteRequest, RouteResponse,
@@ -18,12 +19,14 @@ use uuid::Uuid;
 pub struct AppState {
     pub db: Arc<Db>,
     pub query_cache: Arc<Mutex<HashMap<String, RouteResponse>>>,
+    pub capacity: Arc<CapacityManager>,
 }
 
 pub fn app(db: Arc<Db>) -> Router {
     let state = AppState {
         db,
         query_cache: Arc::new(Mutex::new(HashMap::new())),
+        capacity: Arc::new(CapacityManager::new()),
     };
     Router::new()
         .route("/catalog", post(import_catalog).get(get_catalog))
@@ -38,53 +41,57 @@ fn cache_key(catalog_version: &str, request: &RouteRequest) -> String {
     format!("{}::{}", catalog_version, canonical)
 }
 
-#[doc(hidden)]
-pub fn compute_and_persist(
+fn compute_response(
     state: &AppState,
     catalog: &Catalog,
     request: &RouteRequest,
 ) -> Result<RouteResponse, (StatusCode, String)> {
-    compute_and_persist_inner(state, catalog, request)
-}
+    let (candidates, exclusions, home_options, notices) =
+        router::evaluate(catalog, request);
 
-fn compute_and_persist_inner(
-    state: &AppState,
-    catalog: &Catalog,
-    request: &RouteRequest,
-) -> Result<RouteResponse, (StatusCode, String)> {
-    let key = cache_key(&catalog.catalog_version, request);
+    let mut assigned_slot: Option<String> = None;
+    let mut no_capacity_reason: Option<String> = None;
 
-    if let Some(cached) = state
-        .query_cache
-        .lock()
-        .expect("cache lock poisoned")
-        .get(&key)
-        .cloned()
-    {
-        let snapshot_id = Uuid::new_v4().to_string();
-        let mut response = cached;
-        response.snapshot_id = snapshot_id.clone();
-        persist_snapshot(state, catalog, request, &snapshot_id, &response)?;
-        return Ok(response);
+    if !home_options.is_empty() {
+        let ordered_ids: Vec<String> = home_options
+            .iter()
+            .map(|o| o.slot_id.clone())
+            .collect();
+        match state
+            .capacity
+            .try_assign(&catalog.catalog_version, &ordered_ids)
+        {
+            Ok(slot_id) => {
+                assigned_slot = Some(slot_id);
+            }
+            Err(reason) => {
+                no_capacity_reason = Some(reason);
+            }
+        }
+    } else if notices.iter().any(|n| n.code == "HOME_SERVICE_REQUIRED") {
+        no_capacity_reason = Some(
+            "home service is required but no appointment slots are configured".to_string(),
+        );
     }
 
     let snapshot_id = Uuid::new_v4().to_string();
-    let response = router::route(catalog, request, snapshot_id.clone());
-    persist_snapshot(state, catalog, request, &snapshot_id, &response)?;
-
-    state
-        .query_cache
-        .lock()
-        .expect("cache lock poisoned")
-        .insert(key, response.clone());
+    let response = router::build_response(
+        catalog,
+        candidates,
+        exclusions,
+        home_options,
+        notices,
+        snapshot_id,
+        assigned_slot.as_deref(),
+        no_capacity_reason.as_deref(),
+    );
     Ok(response)
 }
 
-fn persist_snapshot(
+fn persist(
     state: &AppState,
     catalog: &Catalog,
     request: &RouteRequest,
-    snapshot_id: &str,
     response: &RouteResponse,
 ) -> Result<(), (StatusCode, String)> {
     let request_payload = serde_json::to_string(request)
@@ -94,13 +101,52 @@ fn persist_snapshot(
     state
         .db
         .save_snapshot(
-            snapshot_id,
+            &response.snapshot_id,
             &catalog.catalog_version,
             &request_payload,
             &result_payload,
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn compute_and_persist(
+    state: &AppState,
+    catalog: &Catalog,
+    request: &RouteRequest,
+) -> Result<RouteResponse, (StatusCode, String)> {
+    let (_, _, home_options, _) = router::evaluate(catalog, request);
+    let has_home_options = !home_options.is_empty();
+
+    let key = cache_key(&catalog.catalog_version, request);
+    if !has_home_options {
+        if let Some(cached) = state
+            .query_cache
+            .lock()
+            .expect("cache lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            let snapshot_id = Uuid::new_v4().to_string();
+            let mut response = cached;
+            response.snapshot_id = snapshot_id;
+            persist(state, catalog, request, &response)?;
+            return Ok(response);
+        }
+    }
+
+    let response = compute_response(state, catalog, request)?;
+    persist(state, catalog, request, &response)?;
+
+    if !has_home_options {
+        state
+            .query_cache
+            .lock()
+            .expect("cache lock poisoned")
+            .insert(key, response.clone());
+    }
+    Ok(response)
 }
 
 async fn import_catalog(
@@ -111,6 +157,7 @@ async fn import_catalog(
         .db
         .import_catalog(&catalog)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.capacity.reset_for_catalog(&catalog);
     state.query_cache.lock().expect("cache lock poisoned").clear();
     Ok(Json(serde_json::json!({
         "catalogVersion": catalog.catalog_version,
@@ -140,6 +187,7 @@ async fn route_single(
         .load_current_catalog()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::BAD_REQUEST, "no catalog imported".to_string()))?;
+    state.capacity.reset_for_catalog(&catalog);
     let response = compute_and_persist(&state, &catalog, &request)?;
     Ok(Json(response))
 }
@@ -153,6 +201,7 @@ async fn route_batch(
         .load_current_catalog()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::BAD_REQUEST, "no catalog imported".to_string()))?;
+    state.capacity.reset_for_catalog(&catalog);
     let pinned_version = catalog.catalog_version.clone();
     let mut results = Vec::with_capacity(batch.requests.len());
     for request in &batch.requests {

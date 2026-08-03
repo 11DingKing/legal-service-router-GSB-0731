@@ -97,7 +97,20 @@ pub struct HomeService {
     #[serde(rename = "allowedMobility")]
     pub allowed_mobility: BTreeSet<String>,
     pub reason: String,
+    #[serde(default)]
+    pub slots: Vec<HomeServiceSlot>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeServiceSlot {
+    #[serde(rename = "slotId")]
+    pub slot_id: String,
+    pub grid: [i64; 2],
+    pub capacity: u32,
+}
+
+pub const HOME_SERVICE_REASON: &str = "HOME_SERVICE_REQUIRED";
+pub const NO_CAPACITY_REASON: &str = "NO_CAPACITY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mobility {
@@ -145,17 +158,39 @@ pub struct RouteResponse {
     pub catalog_version: String,
     pub candidates: Vec<Candidate>,
     pub exclusions: Vec<Exclusion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notice {
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandidateKind {
+    #[serde(rename = "PHYSICAL")]
+    Physical,
+    #[serde(rename = "HOME_SERVICE")]
+    HomeService,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
     #[serde(rename = "pointId")]
     pub point_id: String,
+    #[serde(rename = "kind", default = "default_candidate_kind")]
+    pub kind: CandidateKind,
     #[serde(rename = "totalCost")]
     pub total_cost: i64,
     pub distance: i64,
     #[serde(rename = "barrierPenalty")]
     pub barrier_penalty: i64,
+}
+
+fn default_candidate_kind() -> CandidateKind {
+    CandidateKind::Physical
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

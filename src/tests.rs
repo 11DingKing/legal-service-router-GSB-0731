@@ -1,7 +1,8 @@
+use crate::capacity::CapacityManager;
 use crate::db::Db;
 use crate::models::{
-    Catalog, Closure, Communication, Degradation, HardRequirements, HomeService, Mobility,
-    RouteRequest, ServicePoint,
+    CandidateKind, Catalog, Closure, Communication, Degradation, HardRequirements, HomeService,
+    HomeServiceSlot, Mobility, RouteRequest, ServicePoint,
 };
 use crate::router;
 use std::collections::BTreeSet;
@@ -79,6 +80,18 @@ fn sample_catalog() -> Catalog {
             allowed_service: "LEGAL_AID".to_string(),
             allowed_mobility: BTreeSet::from(["HOMEBOUND".to_string()]),
             reason: "HOME_SERVICE_REQUIRED".to_string(),
+            slots: vec![
+                HomeServiceSlot {
+                    slot_id: "HOME-SLOT-A".to_string(),
+                    grid: [1, 1],
+                    capacity: 2,
+                },
+                HomeServiceSlot {
+                    slot_id: "HOME-SLOT-B".to_string(),
+                    grid: [5, 5],
+                    capacity: 1,
+                },
+            ],
         },
     }
 }
@@ -271,21 +284,49 @@ fn closure_start_endpoint_is_inclusive_end_is_exclusive() {
 }
 
 #[test]
-fn homebound_applicant_gets_home_service_reason() {
+fn homebound_does_not_force_home_service_when_physical_point_available() {
     let catalog = sample_catalog();
     let req = RouteRequest {
         origin_grid: [1, 1],
         service: "LEGAL_AID".to_string(),
         mobility: vec![Mobility::Homebound],
         communication: vec![],
-        request_time: None,
+        request_time: Some(at("2026-08-05T12:00:00Z")),
     };
     let resp = router::route(&catalog, &req, "snap-9".to_string());
-    assert!(resp.candidates.is_empty());
-    assert!(resp
-        .exclusions
+    assert!(
+        !resp.notices.iter().any(|n| n.code == "HOME_SERVICE_REQUIRED"),
+        "home service must not engage when in-person candidates exist"
+    );
+    assert!(resp.candidates.iter().any(|c| c.point_id == "POINT-A"));
+}
+
+#[test]
+fn homebound_falls_back_to_home_service_when_all_physical_excluded() {
+    let catalog = sample_catalog();
+    let req = RouteRequest {
+        origin_grid: [1, 1],
+        service: "LEGAL_AID".to_string(),
+        mobility: vec![Mobility::Homebound, Mobility::Wheelchair],
+        communication: vec![Communication::Hearing],
+        request_time: Some(at("2026-08-03T15:00:00Z")),
+    };
+    let (candidates, exclusions, home_options, notices) =
+        router::evaluate(&catalog, &req);
+    assert!(candidates.is_empty(), "no physical point should qualify");
+    let excluded_ids: BTreeSet<&str> = exclusions
         .iter()
-        .all(|e| e.reason == "HOME_SERVICE_REQUIRED"));
+        .filter(|e| e.reason == "TEMPORARILY_CLOSED" || e.reason == "MISSING_ACCESSIBILITY")
+        .map(|e| e.point_id.as_str())
+        .collect();
+    assert!(excluded_ids.contains("POINT-A"));
+    assert!(excluded_ids.contains("POINT-B"));
+    assert!(excluded_ids.contains("POINT-C"));
+    assert!(notices
+        .iter()
+        .any(|n| n.code == "HOME_SERVICE_REQUIRED"));
+    assert_eq!(home_options.len(), 2);
+    assert_eq!(home_options[0].slot_id, "HOME-SLOT-A");
 }
 
 #[test]
@@ -754,6 +795,7 @@ fn query_cache_invalidates_on_catalog_import() {
     let state = AppState {
         db: db.clone(),
         query_cache: Arc::new(Mutex::new(HashMap::new())),
+        capacity: Arc::new(CapacityManager::new()),
     };
 
     let req = RouteRequest {
@@ -840,6 +882,227 @@ fn reordering_catalog_points_does_not_change_results() {
         .map(|e| (e.point_id.as_str(), e.reason.as_str()))
         .collect();
     assert_eq!(ex1, ex2);
+}
+
+fn all_physical_excluded_request(origin: [i64; 2], time: &str) -> RouteRequest {
+    RouteRequest {
+        origin_grid: origin,
+        service: "LEGAL_AID".to_string(),
+        mobility: vec![Mobility::Homebound, Mobility::Wheelchair],
+        communication: vec![Communication::Hearing],
+        request_time: Some(at(time)),
+    }
+}
+
+fn test_state() -> crate::api::AppState {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    crate::api::AppState {
+        db,
+        query_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        capacity: Arc::new(CapacityManager::new()),
+    }
+}
+
+#[test]
+fn capacity_assigns_stable_cheapest_home_slot() {
+    let state = test_state();
+    state.db.import_catalog(&sample_catalog()).unwrap();
+    let catalog = state.db.load_current_catalog().unwrap().unwrap();
+    state.capacity.reset_for_catalog(&catalog);
+
+    let req = all_physical_excluded_request([1, 1], "2026-08-03T15:00:00Z");
+    let resp = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+    let home: Vec<_> = resp
+        .candidates
+        .iter()
+        .filter(|c| c.kind == CandidateKind::HomeService)
+        .collect();
+    assert_eq!(home.len(), 1);
+    assert_eq!(home[0].point_id, "HOME-SLOT-A");
+    assert_eq!(home[0].total_cost, 0);
+    assert!(resp.notices.iter().any(|n| n.code == "HOME_SERVICE_REQUIRED"));
+    assert!(!resp.notices.iter().any(|n| n.code == "NO_CAPACITY"));
+}
+
+#[test]
+fn equal_cost_home_slots_compete_by_slot_id() {
+    let mut cat = sample_catalog();
+    cat.home_service.slots = vec![
+        HomeServiceSlot {
+            slot_id: "HOME-SLOT-Z".to_string(),
+            grid: [1, 1],
+            capacity: 1,
+        },
+        HomeServiceSlot {
+            slot_id: "HOME-SLOT-A".to_string(),
+            grid: [1, 1],
+            capacity: 1,
+        },
+        HomeServiceSlot {
+            slot_id: "HOME-SLOT-M".to_string(),
+            grid: [1, 1],
+            capacity: 1,
+        },
+    ];
+    cat.catalog_version = "CAT-TIED-SLOTS".to_string();
+
+    let state = test_state();
+    state.db.import_catalog(&cat).unwrap();
+    let catalog = state.db.load_current_catalog().unwrap().unwrap();
+    state.capacity.reset_for_catalog(&catalog);
+
+    let req = all_physical_excluded_request([1, 1], "2026-08-03T15:00:00Z");
+    let resp = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+    let home = resp
+        .candidates
+        .iter()
+        .find(|c| c.kind == CandidateKind::HomeService)
+        .unwrap();
+    assert_eq!(home.point_id, "HOME-SLOT-A");
+    assert_eq!(home.total_cost, 0);
+}
+
+#[test]
+fn capacity_exhausts_mid_batch_and_returns_no_capacity_notice() {
+    let state = test_state();
+    state.db.import_catalog(&sample_catalog()).unwrap();
+    let catalog = state.db.load_current_catalog().unwrap().unwrap();
+    state.capacity.reset_for_catalog(&catalog);
+
+    let req = all_physical_excluded_request([1, 1], "2026-08-03T15:00:00Z");
+
+    let r1 = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+    let r2 = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+    let r3 = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+    let r4 = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+
+    let assigned: Vec<&str> = [&r1, &r2, &r3]
+        .iter()
+        .filter_map(|r| {
+            r.candidates
+                .iter()
+                .find(|c| c.kind == CandidateKind::HomeService)
+                .map(|c| c.point_id.as_str())
+        })
+        .collect();
+    assert_eq!(assigned.len(), 3);
+    assert_eq!(
+        assigned.iter().filter(|id| **id == "HOME-SLOT-A").count(),
+        2
+    );
+    assert_eq!(
+        assigned.iter().filter(|id| **id == "HOME-SLOT-B").count(),
+        1
+    );
+
+    assert!(r4.candidates
+        .iter()
+        .all(|c| c.kind != CandidateKind::HomeService));
+    assert!(r4.notices.iter().any(|n| n.code == "NO_CAPACITY"));
+
+    let physical_exclusions: Vec<&str> = r4
+        .exclusions
+        .iter()
+        .map(|e| e.point_id.as_str())
+        .collect();
+    assert!(physical_exclusions.contains(&"POINT-A"));
+    assert!(physical_exclusions.contains(&"POINT-B"));
+    assert!(physical_exclusions.contains(&"POINT-C"));
+    assert!(
+        !r4.candidates
+            .iter()
+            .any(|c| c.kind == CandidateKind::Physical),
+        "must not fall back to inaccessible physical points when home capacity is exhausted"
+    );
+}
+
+#[test]
+fn no_home_service_capacity_does_not_fallback_to_inaccessible_physical_points() {
+    let mut cat = sample_catalog();
+    cat.home_service.slots = vec![];
+    cat.catalog_version = "CAT-NO-SLOTS".to_string();
+    let state = test_state();
+    state.db.import_catalog(&cat).unwrap();
+    let catalog = state.db.load_current_catalog().unwrap().unwrap();
+    state.capacity.reset_for_catalog(&catalog);
+
+    let req = all_physical_excluded_request([1, 1], "2026-08-03T15:00:00Z");
+    let resp = crate::api::compute_and_persist(&state, &catalog, &req).unwrap();
+    assert!(resp.candidates.is_empty());
+    assert!(resp.notices.iter().any(|n| n.code == "NO_CAPACITY"));
+    assert!(resp
+        .exclusions
+        .iter()
+        .any(|e| e.point_id == "POINT-A" && e.reason == "MISSING_ACCESSIBILITY"));
+    assert!(resp
+        .exclusions
+        .iter()
+        .any(|e| e.point_id == "POINT-C" && e.reason == "TEMPORARILY_CLOSED"));
+}
+
+#[test]
+fn capacity_resets_on_catalog_version_switch() {
+    let state = test_state();
+    state.db.import_catalog(&sample_catalog()).unwrap();
+    let v1 = state.db.load_current_catalog().unwrap().unwrap();
+    state.capacity.reset_for_catalog(&v1);
+
+    let req = all_physical_excluded_request([1, 1], "2026-08-03T15:00:00Z");
+    for _ in 0..3 {
+        let resp = crate::api::compute_and_persist(&state, &v1, &req).unwrap();
+        assert!(
+            resp.candidates
+                .iter()
+                .any(|c| c.kind == CandidateKind::HomeService)
+                || resp.notices.iter().any(|n| n.code == "NO_CAPACITY")
+        );
+    }
+    let exhausted = crate::api::compute_and_persist(&state, &v1, &req).unwrap();
+    assert!(exhausted.notices.iter().any(|n| n.code == "NO_CAPACITY"));
+
+    let mut v2 = sample_catalog();
+    v2.catalog_version = "CAT-TEST-2".to_string();
+    v2.home_service.slots = vec![HomeServiceSlot {
+        slot_id: "HOME-SLOT-NEW".to_string(),
+        grid: [1, 1],
+        capacity: 1,
+    }];
+    state.db.import_catalog(&v2).unwrap();
+    state.capacity.reset_for_catalog(&v2);
+    let v2_loaded = state.db.load_current_catalog().unwrap().unwrap();
+
+    let resp_v2 = crate::api::compute_and_persist(&state, &v2_loaded, &req).unwrap();
+    let home = resp_v2
+        .candidates
+        .iter()
+        .find(|c| c.kind == CandidateKind::HomeService)
+        .unwrap();
+    assert_eq!(home.point_id, "HOME-SLOT-NEW");
+    assert!(!resp_v2.notices.iter().any(|n| n.code == "NO_CAPACITY"));
+
+    let stored = state
+        .db
+        .load_snapshot(&exhausted.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let replayed: crate::models::RouteResponse = serde_json::from_str(&stored.payload).unwrap();
+    assert_eq!(replayed.catalog_version, "CAT-TEST-1");
+    assert!(replayed.notices.iter().any(|n| n.code == "NO_CAPACITY"));
+}
+
+#[test]
+fn home_service_chain_retains_physical_exclusion_reasons() {
+    let catalog = sample_catalog();
+    let req = all_physical_excluded_request([1, 1], "2026-08-03T15:00:00Z");
+    let (candidates, exclusions, _home_options, notices) =
+        router::evaluate(&catalog, &req);
+    assert!(candidates.is_empty());
+    assert!(notices
+        .iter()
+        .any(|n| n.code == "HOME_SERVICE_REQUIRED"));
+    let reasons: BTreeSet<&str> = exclusions.iter().map(|e| e.reason.as_str()).collect();
+    assert!(reasons.contains("MISSING_ACCESSIBILITY"));
+    assert!(reasons.contains("TEMPORARILY_CLOSED"));
 }
 
 fn clone_request(req: &RouteRequest) -> RouteRequest {

@@ -1,4 +1,5 @@
 mod api;
+mod capacity;
 mod db;
 mod models;
 mod router;
