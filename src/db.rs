@@ -7,7 +7,7 @@ use rusqlite::params;
 use rusqlite::TransactionBehavior;
 use uuid::Uuid;
 
-use crate::catalog::{Catalog, Closure, HomeServiceConfig, Point};
+use crate::catalog::{Catalog, Closure, Degradation, HomeServiceConfig, Point};
 use crate::error::{AppError, AppResult};
 use crate::routing::{Candidate, Excluded, RouteRequest, RouteResult};
 
@@ -80,6 +80,18 @@ pub fn init_schema(pool: &DbPool) -> AppResult<()> {
             point_id TEXT NOT NULL,
             from_time TEXT NOT NULL,
             to_time TEXT NOT NULL,
+            PRIMARY KEY (catalog_version, event_id),
+            FOREIGN KEY (catalog_version, point_id)
+                REFERENCES service_points(catalog_version, point_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS degradations (
+            catalog_version TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            point_id TEXT NOT NULL,
+            from_time TEXT NOT NULL,
+            to_time TEXT NOT NULL,
+            removed_access TEXT NOT NULL,
             PRIMARY KEY (catalog_version, event_id),
             FOREIGN KEY (catalog_version, point_id)
                 REFERENCES service_points(catalog_version, point_id)
@@ -222,6 +234,22 @@ pub fn import_catalog(pool: &DbPool, catalog: &Catalog) -> AppResult<()> {
                 closure.point_id,
                 closure.from.to_rfc3339(),
                 closure.to.to_rfc3339(),
+            ],
+        )?;
+    }
+
+    for deg in &catalog.degradations {
+        tx.execute(
+            "INSERT INTO degradations
+                (catalog_version, event_id, point_id, from_time, to_time, removed_access)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                catalog.catalog_version,
+                deg.event_id,
+                deg.point_id,
+                deg.from.to_rfc3339(),
+                deg.to.to_rfc3339(),
+                serde_json::to_string(&deg.removed_access)?,
             ],
         )?;
     }
@@ -386,6 +414,39 @@ pub fn load_catalog(pool: &DbPool, version: &str) -> AppResult<Catalog> {
         })?
         .collect::<Result<_, _>>()?;
 
+    let mut deg_stmt = conn.prepare(
+        "SELECT event_id, point_id, from_time, to_time, removed_access
+         FROM degradations
+         WHERE catalog_version = ?1
+         ORDER BY event_id ASC",
+    )?;
+    let degradations: Vec<Degradation> = deg_stmt
+        .query_map(params![version], |row| {
+            let from_s: String = row.get(2)?;
+            let to_s: String = row.get(3)?;
+            let ra_s: String = row.get(4)?;
+            Ok(Degradation {
+                event_id: row.get(0)?,
+                point_id: row.get(1)?,
+                from: DateTime::parse_from_rfc3339(&from_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    ))?,
+                to: DateTime::parse_from_rfc3339(&to_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    ))?,
+                removed_access: serde_json::from_str(&ra_s).unwrap_or_default(),
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
     let mut hr_stmt = conn.prepare(
         "SELECT need_code, access_code FROM hard_requirements
          WHERE catalog_version = ?1
@@ -416,6 +477,7 @@ pub fn load_catalog(pool: &DbPool, version: &str) -> AppResult<Catalog> {
         hard_requirements,
         tie_break,
         closures,
+        degradations,
         home_service: HomeServiceConfig {
             allowed_service,
             allowed_mobility,

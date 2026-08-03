@@ -27,7 +27,7 @@ admin API.
 
 ```bash
 cargo run                 # starts on 0.0.0.0:8080, auto-imports the seed catalog
-cargo test                # runs 19 unit + 12 integration tests
+cargo test                # runs 27 unit + 17 integration tests
 ```
 
 Configuration (environment variables):
@@ -81,7 +81,8 @@ Candidates are sorted by:
 
 Excluded points are returned sorted by `pointId` ascending, and their exclusion
 reasons are emitted in a fixed order (`MISSING_SERVICE`, `MISSING_ACCESS`,
-`TEMPORARILY_CLOSED`) so output is identical regardless of import/input order.
+`CAPABILITY_DEGRADED`, `TEMPORARILY_CLOSED`) so output is identical regardless
+of import/input order.
 
 ### Temporary closures
 
@@ -91,6 +92,41 @@ A closure is a half-open interval **`[from, to)`**:
 - at exactly `to` the point **is open** again.
 
 This makes the start/end boundary cases explicit and testable.
+
+### Capability degradations
+
+A degradation event temporarily removes one or more accessibility capabilities
+from a point during a half-open interval `[from, to)`, without closing the point
+entirely. For example, a sign-language interpreter may be unavailable for two
+days while the building remains open for other services.
+
+```json
+{
+  "eventId": "DEGRADE-01",
+  "pointId": "POINT-C",
+  "from": "2026-08-03T00:00:00Z",
+  "to": "2026-08-05T00:00:00Z",
+  "removedAccess": ["SIGN_INTERPRETER"]
+}
+```
+
+During a degradation window:
+
+- If an applicant requires a removed capability, the point is excluded with
+  reason `CAPABILITY_DEGRADED` (including the event id, the affected access
+  code, and the window).
+- If the applicant does not require the removed capability, the point remains a
+  candidate; its effective `access` list in the response reflects the degraded
+  state.
+- A capability that the point never offered statically still reports
+  `MISSING_ACCESS` rather than `CAPABILITY_DEGRADED`.
+
+**Overlap priority.** When a closure and a degradation overlap on the same
+point, the **closure takes precedence**: the point is reported as
+`TEMPORARILY_CLOSED` and no `CAPABILITY_DEGRADED` reason is emitted (the point
+is fully unavailable, so the partial degradation is irrelevant). In the seed
+catalog `CLOSE-01` runs Aug 2–4 and `DEGRADE-01` runs Aug 3–5; they overlap on
+Aug 3, where closure wins.
 
 ### Home service
 
@@ -147,6 +183,7 @@ Exclusion reason objects:
 ```json
 { "code": "MISSING_SERVICE", "service": "LEGAL_AID" }
 { "code": "MISSING_ACCESS", "required": "STEP_FREE" }
+{ "code": "CAPABILITY_DEGRADED", "eventId": "DEGRADE-01", "access": "SIGN_INTERPRETER", "from": "...", "to": "..." }
 { "code": "TEMPORARILY_CLOSED", "eventId": "CLOSE-01", "from": "...", "to": "..." }
 ```
 
@@ -179,6 +216,9 @@ version pinning and immutable replay possible.
 - `point_services` — services offered by a point.
 - `point_access` — accessibility capabilities of a point.
 - `closures` — temporary closure events (`event_id`, `point_id`, `from`, `to`).
+- `degradations` — capability degradation events (`event_id`, `point_id`,
+  `from`, `to`, `removed_access` as a JSON array); partially overlapping with
+  closures is allowed, with closure taking priority.
 - `hard_requirements` — need code -> required access code mapping.
 - `home_service_config` — allowed service, allowed mobility, reason.
 - `active_catalog` — single-row table (`id = 1`) holding the active version.
@@ -244,11 +284,15 @@ The suite covers, among other things:
 - hard-capability filtering overriding proximity;
 - cost ties broken by point id;
 - closure start/end boundary semantics;
+- capability-degradation start/end boundaries and `CAPABILITY_DEGRADED` reasons;
+- closure/degradation overlap priority (closure wins);
 - zero candidates when no point satisfies all hard requirements;
 - home-service eligibility;
-- batch routing pinned to one version;
+- batch routing pinned to one version, including during a concurrent hot update;
 - input-order independence;
 - duplicate version conflict (`409`);
+- snapshot replay preserving degradation and closure state across versions;
+- query-cache correctness after hot reload (new version served, old not leaked);
 - hot reload concurrent with 60 in-flight queries (every response is internally
   consistent and old snapshots stay on their original version);
 - a 400-point catalog run twice with identical, repeatable results.

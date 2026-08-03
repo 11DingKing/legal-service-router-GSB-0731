@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,13 @@ pub enum ExclusionReason {
     },
     MissingAccess {
         required: String,
+    },
+    CapabilityDegraded {
+        #[serde(rename = "eventId")]
+        event_id: String,
+        access: String,
+        from: String,
+        to: String,
     },
     TemporarilyClosed {
         #[serde(rename = "eventId")]
@@ -133,30 +140,65 @@ pub fn compute(catalog: &Catalog, req: &RouteRequest, query_time: DateTime<Utc>)
             });
         }
 
+        let active_closure = catalog
+            .closures
+            .iter()
+            .filter(|c| c.point_id == point.id)
+            .find(|c| query_time >= c.from && query_time < c.to);
+
+        let is_closed = active_closure.is_some();
+        if let Some(closure) = active_closure {
+            reasons.push(ExclusionReason::TemporarilyClosed {
+                event_id: closure.event_id.clone(),
+                from: closure.from.to_rfc3339(),
+                to: closure.to.to_rfc3339(),
+            });
+        }
+
+        let active_degradations: Vec<&crate::catalog::Degradation> = catalog
+            .degradations
+            .iter()
+            .filter(|d| d.point_id == point.id && query_time >= d.from && query_time < d.to)
+            .collect();
+
+        let mut removed_access_map: BTreeSet<&str> = BTreeSet::new();
+        let mut removed_access_event: BTreeMap<&str, &crate::catalog::Degradation> =
+            BTreeMap::new();
+        for deg in &active_degradations {
+            for acc in &deg.removed_access {
+                removed_access_map.insert(acc.as_str());
+                removed_access_event
+                    .entry(acc.as_str())
+                    .or_insert(deg);
+            }
+        }
+
+        let static_access: BTreeSet<&str> = point.access.iter().map(|a| a.as_str()).collect();
+        let effective_access: BTreeSet<&str> = static_access
+            .difference(&removed_access_map)
+            .copied()
+            .collect();
+
         for req_access in &required_access {
-            if !point.access.iter().any(|a| a == req_access) {
+            if !static_access.contains(req_access.as_str()) {
                 reasons.push(ExclusionReason::MissingAccess {
                     required: req_access.clone(),
+                });
+            } else if !effective_access.contains(req_access.as_str()) && !is_closed {
+                let deg = removed_access_event
+                    .get(req_access.as_str())
+                    .copied()
+                    .expect("degradation event for removed access");
+                reasons.push(ExclusionReason::CapabilityDegraded {
+                    event_id: deg.event_id.clone(),
+                    access: req_access.clone(),
+                    from: deg.from.to_rfc3339(),
+                    to: deg.to.to_rfc3339(),
                 });
             }
         }
 
         let services_set: BTreeSet<&str> = point.services.iter().map(|s| s.as_str()).collect();
-        let access_set: BTreeSet<&str> = point.access.iter().map(|a| a.as_str()).collect();
-
-        for closure in &catalog.closures {
-            if closure.point_id != point.id {
-                continue;
-            }
-            let closed = query_time >= closure.from && query_time < closure.to;
-            if closed {
-                reasons.push(ExclusionReason::TemporarilyClosed {
-                    event_id: closure.event_id.clone(),
-                    from: closure.from.to_rfc3339(),
-                    to: closure.to.to_rfc3339(),
-                });
-            }
-        }
 
         if reasons.is_empty() {
             let distance =
@@ -172,7 +214,7 @@ pub fn compute(catalog: &Catalog, req: &RouteRequest, query_time: DateTime<Utc>)
                 },
                 grid: point.grid,
                 services: services_set.into_iter().map(|s| s.to_string()).collect(),
-                access: access_set.into_iter().map(|s| s.to_string()).collect(),
+                access: effective_access.into_iter().map(|s| s.to_string()).collect(),
             });
         } else {
             excluded.push(Excluded {
@@ -210,7 +252,8 @@ fn compare_reasons(a: &ExclusionReason, b: &ExclusionReason) -> std::cmp::Orderi
         match r {
             MissingService { .. } => 0,
             MissingAccess { .. } => 1,
-            TemporarilyClosed { .. } => 2,
+            CapabilityDegraded { .. } => 2,
+            TemporarilyClosed { .. } => 3,
         }
     };
     rank(a)
@@ -268,7 +311,7 @@ pub fn validate_request(req: &RouteRequest) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{Closure, HomeServiceConfig, Point};
+    use crate::catalog::{Closure, Degradation, HomeServiceConfig, Point};
     use chrono::{Duration, TimeZone, Utc};
     use std::collections::HashMap;
 
@@ -278,13 +321,20 @@ mod tests {
         (from, to)
     }
 
+    fn degrade_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        let from = Utc.with_ymd_and_hms(2026, 8, 3, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2026, 8, 5, 0, 0, 0).unwrap();
+        (from, to)
+    }
+
     fn open_time() -> DateTime<Utc> {
-        let (_, to) = closure_window();
+        let (_, to) = degrade_window();
         to + Duration::days(1)
     }
 
     fn sample_catalog() -> Catalog {
-        let (from, to) = closure_window();
+        let (c_from, c_to) = closure_window();
+        let (d_from, d_to) = degrade_window();
         let mut hard = HashMap::new();
         hard.insert("WHEELCHAIR".into(), "STEP_FREE".into());
         hard.insert("HEARING".into(), "SIGN_INTERPRETER".into());
@@ -325,8 +375,15 @@ mod tests {
             closures: vec![Closure {
                 event_id: "CLOSE-01".into(),
                 point_id: "POINT-C".into(),
-                from,
-                to,
+                from: c_from,
+                to: c_to,
+            }],
+            degradations: vec![Degradation {
+                event_id: "DEGRADE-01".into(),
+                point_id: "POINT-C".into(),
+                from: d_from,
+                to: d_to,
+                removed_access: vec!["SIGN_INTERPRETER".into()],
             }],
             home_service: HomeServiceConfig {
                 allowed_service: "LEGAL_AID".into(),
@@ -557,6 +614,7 @@ mod tests {
         let mut cat2 = sample_catalog();
         cat2.points.reverse();
         cat2.closures.reverse();
+        cat2.degradations.reverse();
         let t = open_time();
         let request = req("LEGAL_AID", &["WHEELCHAIR"], &["HEARING"], t);
 
@@ -586,6 +644,135 @@ mod tests {
         let r = compute(&cat, &request, from);
         let b = r.excluded.iter().find(|e| e.point_id == "POINT-B").unwrap();
         assert_eq!(b.reasons.len(), 1);
+    }
+
+    #[test]
+    fn test_degradation_before_start_has_no_effect() {
+        let cat = sample_catalog();
+        let (c_from, _) = closure_window();
+        let t = c_from - Duration::seconds(1);
+        let r = compute(&cat, &req("LEGAL_AID", &[], &["HEARING"], t), t);
+        let c = r.candidates.iter().find(|c| c.point_id == "POINT-C").unwrap();
+        assert!(c.access.contains(&"SIGN_INTERPRETER".to_string()));
+        assert!(r.excluded.iter().all(|e| e.point_id != "POINT-C"));
+    }
+
+    #[test]
+    fn test_degradation_start_boundary_is_active() {
+        let mut cat = sample_catalog();
+        cat.closures = vec![];
+        let (d_from, _) = degrade_window();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &[], &["HEARING"], d_from),
+            d_from,
+        );
+        let c = r.excluded.iter().find(|e| e.point_id == "POINT-C").unwrap();
+        assert!(matches!(
+            &c.reasons[0],
+            ExclusionReason::CapabilityDegraded { event_id, access, .. }
+                if event_id == "DEGRADE-01" && access == "SIGN_INTERPRETER"
+        ));
+    }
+
+    #[test]
+    fn test_degradation_end_boundary_is_inactive() {
+        let cat = sample_catalog();
+        let (_, d_to) = degrade_window();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &[], &["HEARING"], d_to),
+            d_to,
+        );
+        let ids: Vec<_> = r.candidates.iter().map(|c| c.point_id.clone()).collect();
+        assert!(ids.contains(&"POINT-C".to_string()));
+        assert!(r.excluded.iter().all(|e| e.point_id != "POINT-C"));
+    }
+
+    #[test]
+    fn test_overlap_closure_takes_priority_over_degradation() {
+        let cat = sample_catalog();
+        let overlap = Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &[], &["HEARING"], overlap),
+            overlap,
+        );
+        let c = r.excluded.iter().find(|e| e.point_id == "POINT-C").unwrap();
+        assert_eq!(c.reasons.len(), 1);
+        assert!(matches!(
+            &c.reasons[0],
+            ExclusionReason::TemporarilyClosed { event_id, .. } if event_id == "CLOSE-01"
+        ));
+        assert!(!c.reasons.iter().any(|r| matches!(r, ExclusionReason::CapabilityDegraded { .. })));
+    }
+
+    #[test]
+    fn test_degradation_after_closure_excludes_hearing_only() {
+        let cat = sample_catalog();
+        let after_closure = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).unwrap();
+        let r_hearing = compute(
+            &cat,
+            &req("LEGAL_AID", &[], &["HEARING"], after_closure),
+            after_closure,
+        );
+        let c = r_hearing.excluded.iter().find(|e| e.point_id == "POINT-C").unwrap();
+        assert!(matches!(
+            &c.reasons[0],
+            ExclusionReason::CapabilityDegraded { event_id, access, .. }
+                if event_id == "DEGRADE-01" && access == "SIGN_INTERPRETER"
+        ));
+
+        let r_wheelchair = compute(
+            &cat,
+            &req("LEGAL_AID", &["WHEELCHAIR"], &[], after_closure),
+            after_closure,
+        );
+        let ids: Vec<_> = r_wheelchair.candidates.iter().map(|c| c.point_id.clone()).collect();
+        assert!(ids.contains(&"POINT-C".to_string()));
+    }
+
+    #[test]
+    fn test_degraded_candidate_shows_effective_access() {
+        let cat = sample_catalog();
+        let after_closure = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).unwrap();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &["WHEELCHAIR"], &["SPEECH"], after_closure),
+            after_closure,
+        );
+        let c = r.candidates.iter().find(|c| c.point_id == "POINT-C").unwrap();
+        assert!(!c.access.contains(&"SIGN_INTERPRETER".to_string()));
+        assert!(c.access.contains(&"STEP_FREE".to_string()));
+        assert!(c.access.contains(&"TEXT_COMMUNICATION".to_string()));
+    }
+
+    #[test]
+    fn test_equal_cost_candidates_stable_tie_break_by_point_id() {
+        let cat = sample_catalog();
+        let t = open_time();
+        let r = compute(&cat, &req("LEGAL_AID", &[], &[], t), t);
+        let equal_cost: Vec<_> = r.candidates.iter().filter(|c| c.total_cost == 2).collect();
+        assert_eq!(equal_cost.len(), 2);
+        assert_eq!(equal_cost[0].point_id, "POINT-A");
+        assert_eq!(equal_cost[1].point_id, "POINT-B");
+        assert_eq!(equal_cost[0].rank, 1);
+        assert_eq!(equal_cost[1].rank, 2);
+    }
+
+    #[test]
+    fn test_outside_both_intervals_all_points_open() {
+        let cat = sample_catalog();
+        let t = open_time();
+        let r = compute(
+            &cat,
+            &req("LEGAL_AID", &["WHEELCHAIR"], &["HEARING", "SPEECH"], t),
+            t,
+        );
+        let ids: Vec<_> = r.candidates.iter().map(|c| c.point_id.clone()).collect();
+        assert_eq!(ids, vec!["POINT-C"]);
+        let c = r.candidates.iter().find(|c| c.point_id == "POINT-C").unwrap();
+        assert!(c.access.contains(&"SIGN_INTERPRETER".to_string()));
     }
 }
 

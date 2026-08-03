@@ -26,6 +26,7 @@ fn v1_catalog() -> Value {
         "hardRequirements": {"WHEELCHAIR": "STEP_FREE", "HEARING": "SIGN_INTERPRETER", "SPEECH": "TEXT_COMMUNICATION"},
         "tieBreak": ["totalCost ascending", "point id ascending"],
         "closures": [{"eventId": "CLOSE-01", "pointId": "POINT-C", "from": "2026-08-02T00:00:00Z", "to": "2026-08-04T00:00:00Z"}],
+        "degradations": [{"eventId": "DEGRADE-01", "pointId": "POINT-C", "from": "2026-08-03T00:00:00Z", "to": "2026-08-05T00:00:00Z", "removedAccess": ["SIGN_INTERPRETER"]}],
         "homeService": {"allowedService": "LEGAL_AID", "allowedMobility": ["HOMEBOUND"], "reason": "HOME_SERVICE_REQUIRED"}
     })
 }
@@ -44,6 +45,7 @@ fn v2_catalog() -> Value {
             "barrierPenalty": 0
         }));
     cat["closures"] = json!([]);
+    cat["degradations"] = json!([]);
     cat
 }
 
@@ -543,4 +545,237 @@ async fn test_large_catalog_performance_is_repeatable() {
         second_elapsed.as_secs() < 10,
         "second run too slow: {second_elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn test_degradation_excludes_point_over_http() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let r = route(
+        &base,
+        &json!({
+            "originGrid": [2, 2],
+            "service": "LEGAL_AID",
+            "communication": ["HEARING"],
+            "queryTime": "2026-08-04T12:00:00Z"
+        }),
+    )
+    .await;
+
+    let c = r["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["pointId"] == "POINT-C")
+        .unwrap();
+    assert_eq!(c["reasons"][0]["code"], "CAPABILITY_DEGRADED");
+    assert_eq!(c["reasons"][0]["eventId"], "DEGRADE-01");
+    assert_eq!(c["reasons"][0]["access"], "SIGN_INTERPRETER");
+
+    let wheelchair = route(
+        &base,
+        &json!({
+            "originGrid": [2, 2],
+            "service": "LEGAL_AID",
+            "mobility": ["WHEELCHAIR"],
+            "queryTime": "2026-08-04T12:00:00Z"
+        }),
+    )
+    .await;
+    let ids: Vec<&str> = wheelchair["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["pointId"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"POINT-C"));
+}
+
+#[tokio::test]
+async fn test_overlap_closure_priority_over_http() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let r = route(
+        &base,
+        &json!({
+            "originGrid": [2, 2],
+            "service": "LEGAL_AID",
+            "communication": ["HEARING"],
+            "queryTime": "2026-08-03T12:00:00Z"
+        }),
+    )
+    .await;
+
+    let c = r["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["pointId"] == "POINT-C")
+        .unwrap();
+    let reason_codes: Vec<&str> = c["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(reason_codes, vec!["TEMPORARILY_CLOSED"]);
+}
+
+#[tokio::test]
+async fn test_snapshot_replay_preserves_degradation_state() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let degraded = route(
+        &base,
+        &json!({
+            "originGrid": [2, 2],
+            "service": "LEGAL_AID",
+            "communication": ["HEARING"],
+            "queryTime": "2026-08-04T12:00:00Z"
+        }),
+    )
+    .await;
+    assert_eq!(degraded["catalogVersion"], "CAT-V1");
+    let snap_id = degraded["snapshotId"].as_str().unwrap().to_string();
+    let c_excluded = degraded["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["pointId"] == "POINT-C"
+            && e["reasons"][0]["code"] == "CAPABILITY_DEGRADED");
+    assert!(c_excluded);
+
+    import(&base, &v2_catalog()).await;
+
+    let replayed: Value = reqwest::Client::new()
+        .get(format!("{base}/snapshots/{snap_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed["catalogVersion"], "CAT-V1");
+    let replayed_c = replayed["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["pointId"] == "POINT-C")
+        .unwrap();
+    assert_eq!(replayed_c["reasons"][0]["code"], "CAPABILITY_DEGRADED");
+    let replayed_ids: Vec<&str> = replayed["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["pointId"].as_str().unwrap())
+        .collect();
+    assert!(!replayed_ids.contains(&"POINT-D"));
+}
+
+#[tokio::test]
+async fn test_batch_all_results_pinned_to_one_version_during_hot_update() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let client = reqwest::Client::new();
+    let batch_body = json!({
+        "requests": (0..40).map(|i| json!({
+            "originGrid": [i % 5, i % 5],
+            "service": "LEGAL_AID",
+            "queryTime": "2026-08-05T00:00:00Z"
+        })).collect::<Vec<_>>()
+    });
+
+    let base_clone = base.clone();
+    let client_clone = client.clone();
+    let batch_task = tokio::spawn(async move {
+        client_clone
+            .post(format!("{base_clone}/route/batch"))
+            .json(&batch_body)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    import(&base, &v2_catalog()).await;
+
+    let batch_resp = batch_task.await.unwrap();
+    let results = batch_resp["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+
+    let versions: Vec<&str> = results
+        .iter()
+        .map(|r| r["response"]["catalogVersion"].as_str().unwrap())
+        .collect();
+    let first_version = versions[0];
+    assert!(
+        versions.iter().all(|v| *v == first_version),
+        "batch mixed versions: {versions:?}"
+    );
+
+    for item in results {
+        let cands = item["response"]["candidates"].as_array().unwrap();
+        let ids: Vec<&str> = cands.iter().map(|c| c["pointId"].as_str().unwrap()).collect();
+        if first_version == "CAT-V1" {
+            assert!(
+                !ids.contains(&"POINT-D"),
+                "V1 batch leaked POINT-D"
+            );
+        } else {
+            assert!(
+                ids.contains(&"POINT-D"),
+                "V2 batch missing POINT-D"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_cache_serves_new_version_after_hot_reload() {
+    let (base, _dir) = spawn_app().await;
+    import(&base, &v1_catalog()).await;
+
+    let r1 = route(
+        &base,
+        &json!({"originGrid": [2, 2], "service": "LEGAL_AID", "queryTime": "2026-08-05T00:00:00Z"}),
+    )
+    .await;
+    assert_eq!(r1["catalogVersion"], "CAT-V1");
+    let r1_ids: Vec<&str> = r1["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["pointId"].as_str().unwrap())
+        .collect();
+    assert!(!r1_ids.contains(&"POINT-D"));
+
+    import(&base, &v2_catalog()).await;
+
+    for _ in 0..5 {
+        let r2 = route(
+            &base,
+            &json!({"originGrid": [2, 2], "service": "LEGAL_AID", "queryTime": "2026-08-05T00:00:00Z"}),
+        )
+        .await;
+        assert_eq!(r2["catalogVersion"], "CAT-V2");
+        assert_eq!(r2["candidates"][0]["pointId"], "POINT-D");
+        assert_eq!(r2["candidates"][0]["totalCost"], 0);
+    }
+
+    let active: Value = reqwest::Client::new()
+        .get(format!("{base}/admin/active"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(active["catalogVersion"], "CAT-V2");
 }

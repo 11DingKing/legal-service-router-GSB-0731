@@ -16,7 +16,10 @@ pub struct Catalog {
     pub hard_requirements: HashMap<String, String>,
     #[serde(rename = "tieBreak")]
     pub tie_break: Vec<String>,
+    #[serde(default)]
     pub closures: Vec<Closure>,
+    #[serde(default, rename = "degradations")]
+    pub degradations: Vec<Degradation>,
     #[serde(rename = "homeService")]
     pub home_service: HomeServiceConfig,
 }
@@ -41,6 +44,20 @@ pub struct Closure {
     pub from: DateTime<Utc>,
     #[serde(deserialize_with = "parse_time", serialize_with = "serialize_time")]
     pub to: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Degradation {
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "pointId")]
+    pub point_id: String,
+    #[serde(deserialize_with = "parse_time", serialize_with = "serialize_time")]
+    pub from: DateTime<Utc>,
+    #[serde(deserialize_with = "parse_time", serialize_with = "serialize_time")]
+    pub to: DateTime<Utc>,
+    #[serde(rename = "removedAccess")]
+    pub removed_access: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +128,27 @@ fn validate_catalog(catalog: &Catalog) -> AppResult<()> {
             return Err(AppError::BadRequest(format!(
                 "closure {} references unknown point {}",
                 c.event_id, c.point_id
+            )));
+        }
+    }
+
+    for d in &catalog.degradations {
+        if d.to <= d.from {
+            return Err(AppError::BadRequest(format!(
+                "degradation {} has to <= from",
+                d.event_id
+            )));
+        }
+        if !catalog.points.iter().any(|p| p.id == d.point_id) {
+            return Err(AppError::BadRequest(format!(
+                "degradation {} references unknown point {}",
+                d.event_id, d.point_id
+            )));
+        }
+        if d.removed_access.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "degradation {} must remove at least one access capability",
+                d.event_id
             )));
         }
     }
